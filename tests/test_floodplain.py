@@ -35,6 +35,7 @@ def test_binary_output_and_nodata_propagation(tmp_path):
     with rasterio.open(output_path) as src:
         result = src.read(1)
         assert src.nodata == 255
-        assert set(np.unique(result)).issubset({0, 1})
+        assert set(np.unique(result)).issubset({0, 1, 255})
+        assert result[0, 3] == 255
         assert result[0, 0] == 1
         assert result[0, 2] == 0

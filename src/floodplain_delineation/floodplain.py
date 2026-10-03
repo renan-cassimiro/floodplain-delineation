@@ -34,7 +34,6 @@ def create_floodplain(
             transform=transform,
             nodata=255,
             compress="deflate",
-            predictor=2,
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with rasterio.open(output_path, "w", **profile) as dst:
