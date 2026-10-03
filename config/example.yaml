@@ -1,0 +1,41 @@
+project:
+  name: "floodplain_delineation"
+
+inputs:
+  dem: "data/input/dem.tif"
+  pilot_area:
+    path: "data/input/pilot_area.gpkg"
+    layer: "pilot_area"
+
+crs:
+  # CRS to interpret as the original CRS of inputs when a source CRS is missing.
+  # If a source CRS is present, it must match this configured CRS.
+  input: "EPSG:4326"
+  # Processing CRS. It must be projected and use metres as its linear unit.
+  output: "EPSG:31983"
+
+hydrology:
+  # Explicit processing buffer around the pilot area. Choose this from the study
+  # context and drainage scale; it is intentionally not hard-coded by the code.
+  processing_buffer:
+    value: 1000
+    units: "m"
+  stream_threshold:
+    value: 1000
+    units: "cells"
+  depression_method: "fill_depressions"
+
+floodplain:
+  hand_threshold:
+    value: 5.0
+    units: "m"
+
+outputs:
+  directory: "data/output"
+  conditioned_dem: "conditioned_dem.tif"
+  flow_direction: "flow_direction.tif"
+  flow_accumulation: "flow_accumulation.tif"
+  drainage_raster: "derived_drainage.tif"
+  drainage: "derived_drainage.gpkg"
+  hand: "hand.tif"
+  floodplain: "potential_floodplain.tif"

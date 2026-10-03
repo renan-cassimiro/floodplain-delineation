@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+.env
+.DS_Store
+
+# Generated geospatial products
+/data/input/*
+/data/output/*
+!/data/input/.gitkeep
+!/data/output/.gitkeep
+
+# WhiteboxTools local binaries/cache
+whitebox_tools/

@@ -1,0 +1,13 @@
+name: floodplain-delineation
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - rasterio=1.4.*
+  - geopandas=1.1.*
+  - numpy=2.*
+  - pyyaml=6.*
+  - shapely=2.*
+  - pyproj=3.7.*
+  - whitebox=2.3.*
+  - pytest=8.*
