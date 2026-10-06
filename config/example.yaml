@@ -1,41 +1,38 @@
+# Example configuration (illustrative values only -- NOT calibrated for any basin).
+# Relative paths are resolved against the current working directory.
 project:
-  name: "floodplain_delineation"
+  name: "potential_floodplain_delineation"
 
 inputs:
-  dem: "data/input/dem.tif"
-  pilot_area:
-    path: "data/input/pilot_area.gpkg"
-    layer: "pilot_area"
+  dem: "data/input/xingu_river/xingu_river_fathomdem_30m_cog.tif"                 # single-band elevation raster with CRS and nodata
+  pilot_area: "data/input/xingu_river/xingu_river_study_area_bounding_box.gpkg"  # polygon layer(s); multiple polygons are dissolved
+  pilot_layer: xingu_river_study_area_bounding_box                   # optional GPKG layer name
+  vertical_units: "meters"            # vertical unit of the DEM (documentation + HAND threshold unit)
 
-crs:
-  # CRS to interpret as the original CRS of inputs when a source CRS is missing.
-  # If a source CRS is present, it must match this configured CRS.
-  input: "EPSG:4326"
-  # Processing CRS. It must be projected and use metres as its linear unit.
-  output: "EPSG:31983"
-
-hydrology:
-  # Explicit processing buffer around the pilot area. Choose this from the study
-  # context and drainage scale; it is intentionally not hard-coded by the code.
-  processing_buffer:
-    value: 1000
-    units: "m"
-  stream_threshold:
-    value: 1000
-    units: "cells"
-  depression_method: "fill_depressions"
-
-floodplain:
-  hand_threshold:
-    value: 5.0
-    units: "m"
+processing:
+  buffer_distance: 5000               # context buffer around the pilot area
+  buffer_units: "meters"              # "meters" or "cells"
+  conditioning:
+    method: "breach"                  # "breach" (BreachDepressions) or "fill" (FillDepressionsWangAndLiu)
+  flow:
+    algorithm: "d8"                   # only D8 is supported
+  drainage:
+    threshold_type: "area_km2"        # "cells" or "area_km2"
+    threshold_value: 100              # minimum contributing cells or km2 to define drainage
+  hand:
+    threshold: 7.5                      # same vertical unit as the DEM
 
 outputs:
-  directory: "data/output"
-  conditioned_dem: "conditioned_dem.tif"
-  flow_direction: "flow_direction.tif"
-  flow_accumulation: "flow_accumulation.tif"
-  drainage_raster: "derived_drainage.tif"
-  drainage: "derived_drainage.gpkg"
-  hand: "hand.tif"
-  floodplain: "potential_floodplain.tif"
+  directory: "outputs"
+  intermediates: "intermediate"
+  final: "final"
+  save_conditioned_dem: true
+  save_flow_direction: true
+  save_flow_accumulation: true
+  save_drainage_network: true
+  save_hand: true
+
+execution:
+  overwrite: false
+  verbose: true
+  # whitebox_executable: "/path/to/whitebox_tools"   # optional; auto-detected otherwise

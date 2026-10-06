@@ -9,6 +9,8 @@ __pycache__/
 # Generated geospatial products
 /data/input/*
 /data/output/*
+/data/output*
+/output*
 !/data/input/.gitkeep
 !/data/output/.gitkeep
 

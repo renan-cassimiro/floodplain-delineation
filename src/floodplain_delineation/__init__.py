@@ -1,3 +1,3 @@
-"""DEM-derived potential floodplain delineation package."""
+"""Preliminary potentially inundatable floodplain delineation from a DEM (HAND-based)."""
 
 __version__ = "0.1.0"
