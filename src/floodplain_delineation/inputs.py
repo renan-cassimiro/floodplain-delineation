@@ -73,7 +73,7 @@ class SpatialDomain:
 
 # --------------------------------------------------------------------------- #
 def validate_input_files(config: Config) -> None:
-    """Check that the DEM and the pilot-area file exist and are readable."""
+    """Check that the DEM and the pilot-area file exist and are readable.
     for label, path in (("DEM", config.inputs.dem), ("Pilot-area GeoPackage", config.inputs.pilot_area)):
         if not path.exists():
             raise InputError(f"{label} file not found: {path}. Check 'inputs' in the configuration.")
@@ -85,7 +85,7 @@ def validate_input_files(config: Config) -> None:
         except OSError as exc:
             raise InputError(f"{label} file is not readable: {path} ({exc})") from exc
     if config.inputs.pilot_area.suffix.lower() != ".gpkg":
-        raise InputError(f"Pilot area must be a GeoPackage (.gpkg), got: {config.inputs.pilot_area.name}")
+        raise InputError(f"Pilot area must be a GeoPackage (.gpkg), got: {config.inputs.pilot_area.name}")"""
 
 
 def read_dem_info(path: Path, warnings: Optional[WarningCollector] = None) -> DemInfo:
@@ -266,48 +266,172 @@ def bounds_to_window(
         sides.append("north")
     return window, actual, sides
 
-
-def prepare_spatial_domain(dem: DemInfo, config: Config, warnings: WarningCollector) -> SpatialDomain:
+def prepare_spatial_domain(
+    dem: DemInfo,
+    config: Config,
+    warnings: WarningCollector,
+) -> SpatialDomain:
     """Build the pilot geometry, its DEM intersection and the processing window."""
+
+    # ------------------------------------------------------------------
+    # No pilot area provided:
+    # use the complete DEM footprint as the processing and final area.
+    # A buffer is not applied because there is no raster context outside
+    # the DEM footprint to support additional hydrological routing.
+    # ------------------------------------------------------------------
+    if not config.inputs.pilot_area:
+        warnings.add(
+            "No pilot area was provided; the DEM bounding box is being used "
+            "as the processing and final output area."
+        )
+
+        footprint = box(*dem.bounds)
+
+        if config.processing.buffer_distance > 0:
+            warnings.add(
+                "buffer_distance is ignored because no pilot area was provided. "
+                "The DEM bounding box already defines the complete available "
+                "processing extent, and no raster context exists outside the DEM."
+            )
+
+        # The entire DEM is the processing window.
+        window = rasterio.windows.Window(
+            col_off=0,
+            row_off=0,
+            width=dem.width,
+            height=dem.height,
+        )
+
+        actual = tuple(dem.bounds)
+        requested = actual
+
+        truncated = [
+            "left",
+            "right",
+            "top",
+            "bottom",
+        ]
+
+        binfo = {
+            "distance": 0,
+            "units": config.processing.buffer_units,
+            "applied": False,
+            "reason": (
+                "No pilot area was provided; the DEM footprint defines the "
+                "complete processing and output extent."
+            ),
+            "note": (
+                "No external context is available beyond the DEM boundary. "
+                "Flow routing near the DEM edges may therefore be affected "
+                "by artificial boundary effects."
+            ),
+        }
+
+        warnings.add(
+            "The processing area coincides with the DEM footprint. "
+            "Hydrological routing near the DEM boundaries may lack upstream "
+            "context and may be affected by artificial edge effects."
+        )
+
+        return SpatialDomain(
+            pilot_full=footprint,
+            pilot=footprint,
+            source_crs=dem.crs,
+            n_features=1,
+            coverage_fraction=1.0,
+            window=window,
+            window_transform=dem.transform,
+            extent_bounds=actual,
+            requested_bounds=requested,
+            truncated_sides=truncated,
+            buffer_info=binfo,
+        )
+
+    # ------------------------------------------------------------------
+    # Normal workflow:
+    # read and validate the pilot area from the GPKG.
+    # ------------------------------------------------------------------
     pilot_full, src_crs, n_features = read_pilot_geometry(
-        config.inputs.pilot_area, config.inputs.pilot_layer, dem, warnings
+        config.inputs.pilot_area,
+        config.inputs.pilot_layer,
+        dem,
+        warnings,
     )
+
     footprint = box(*dem.bounds)
-    inter = _polygonal_part(pilot_full.intersection(footprint))
+
+    inter = _polygonal_part(
+        pilot_full.intersection(footprint)
+    )
+
     if inter is None or inter.area <= 0:
         raise InputError(
-            "The pilot area does not intersect the DEM footprint. Check that both datasets cover "
-            f"the same region. DEM bounds: {dem.bounds}; pilot bounds (DEM CRS): {pilot_full.bounds}."
-        )
-    coverage = inter.area / pilot_full.area
-    if coverage < 1 - 1e-9:
-        warnings.add(
-            f"Only {coverage:.1%} of the pilot area lies within the DEM footprint; the final map is "
-            "restricted to the covered part."
+            "The pilot area does not intersect the DEM footprint. "
+            "Check that both datasets cover the same region. "
+            f"DEM bounds: {dem.bounds}; "
+            f"pilot bounds (DEM CRS): {pilot_full.bounds}."
         )
 
+    coverage = inter.area / pilot_full.area
+
+    if coverage < 1 - 1e-9:
+        warnings.add(
+            f"Only {coverage:.1%} of the pilot area lies within the DEM "
+            "footprint; the final map is restricted to the covered part."
+        )
+
+    # ------------------------------------------------------------------
+    # Apply the configured buffer only when an explicit pilot area exists.
+    # ------------------------------------------------------------------
     buffer_cfg = config.processing
-    buffered, binfo = _buffer_geometry(pilot_full, dem, buffer_cfg.buffer_distance, buffer_cfg.buffer_units)
+
+    buffered, binfo = _buffer_geometry(
+        pilot_full,
+        dem,
+        buffer_cfg.buffer_distance,
+        buffer_cfg.buffer_units,
+    )
+
     if buffer_cfg.buffer_distance == 0:
         warnings.add(
-            "buffer_distance is 0: hydrological processing runs on a tightly clipped DEM and is "
-            "exposed to artificial edge effects."
+            "buffer_distance is 0: hydrological processing runs on a "
+            "tightly clipped DEM and is exposed to artificial edge effects."
         )
+
     requested = tuple(buffered.bounds)
-    window, actual, truncated = bounds_to_window(requested, dem)
+
+    window, actual, truncated = bounds_to_window(
+        requested,
+        dem,
+    )
+
     if truncated:
         warnings.add(
-            f"The requested context buffer is truncated by the DEM edge on the {', '.join(truncated)} "
-            "side(s); flow routing near those sides lacks upstream context."
+            f"The requested context buffer is truncated by the DEM edge "
+            f"on the {', '.join(truncated)} side(s); flow routing near "
+            "those sides lacks upstream context."
         )
+
     warnings_note = (
-        "A buffer cannot guarantee correct upstream hydrology if the DEM does not extend "
-        "sufficiently beyond the area of interest."
+        "A buffer cannot guarantee correct upstream hydrology if the DEM "
+        "does not extend sufficiently beyond the area of interest."
     )
+
     binfo["note"] = warnings_note
+
     return SpatialDomain(
-        pilot_full=pilot_full, pilot=inter, source_crs=src_crs, n_features=n_features,
-        coverage_fraction=coverage, window=window,
-        window_transform=rasterio.windows.transform(window, dem.transform),
-        extent_bounds=actual, requested_bounds=requested, truncated_sides=truncated, buffer_info=binfo,
+        pilot_full=pilot_full,
+        pilot=inter,
+        source_crs=src_crs,
+        n_features=n_features,
+        coverage_fraction=coverage,
+        window=window,
+        window_transform=rasterio.windows.transform(
+            window,
+            dem.transform,
+        ),
+        extent_bounds=actual,
+        requested_bounds=requested,
+        truncated_sides=truncated,
+        buffer_info=binfo,
     )

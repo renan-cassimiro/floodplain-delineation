@@ -68,7 +68,12 @@ def plan_outputs(config: Config) -> OutputPlan:
 
 def prepare_output_dirs(plan: OutputPlan, config: Config) -> None:
     """Check conflicts (inputs / existing files) BEFORE any processing, then create directories."""
-    inputs = {config.inputs.dem.resolve(), config.inputs.pilot_area.resolve()}
+
+    inputs = {config.inputs.dem.resolve()}
+
+    if config.inputs.pilot_area is not None:
+        inputs.add(Path(config.inputs.pilot_area).resolve())
+        
     clash = [p for p in plan.all_files if p.resolve() in inputs]
     if clash:
         raise OutputError(f"Output path(s) coincide with input files: {clash}. Change outputs.directory.")

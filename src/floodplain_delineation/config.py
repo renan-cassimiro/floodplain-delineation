@@ -222,7 +222,7 @@ def parse_config(data: Any, *, source_path: Optional[Path] = None, source_sha256
     inp = _section(top["inputs"], "inputs", ("dem", "pilot_area", "vertical_units"), ("pilot_layer",))
     inputs = InputsConfig(
         dem=_path(inp["dem"], "inputs.dem"),
-        pilot_area=_path(inp["pilot_area"], "inputs.pilot_area"),
+        pilot_area=_string(inp["pilot_area"], "inputs.pilot_area", allow_none=True),
         pilot_layer=_string(inp.get("pilot_layer"), "inputs.pilot_layer", allow_none=True),
         vertical_units=_choice(inp["vertical_units"], "inputs.vertical_units", VERTICAL_UNITS),
     )

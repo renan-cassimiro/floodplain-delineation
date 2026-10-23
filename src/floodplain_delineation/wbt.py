@@ -37,6 +37,7 @@ def locate_executable(explicit: Optional[Path] = None) -> Path:
             import whitebox
 
             wbt = whitebox.WhiteboxTools()
+            wbt.set_max_procs(18) 
             candidates.append(Path(wbt.exe_path) / wbt.exe_name)
         except Exception as exc:  # pragma: no cover - environment dependent
             log.debug("whitebox package lookup failed: %s", exc)

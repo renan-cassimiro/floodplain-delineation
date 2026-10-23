@@ -4,13 +4,13 @@ project:
   name: "potential_floodplain_delineation"
 
 inputs:
-  dem: "data/input/xingu_river/xingu_river_fathomdem_30m_cog.tif"                 # single-band elevation raster with CRS and nodata
-  pilot_area: "data/input/xingu_river/xingu_river_study_area_bounding_box.gpkg"  # polygon layer(s); multiple polygons are dissolved
-  pilot_layer: xingu_river_study_area_bounding_box                   # optional GPKG layer name
+  dem: "../../grupos/inpa/abiotic_data/amazon_basin/uhe2025/processed/fathomdem/amazon_basin_fathomdem_30m_cog/amazon_basin_fathomdem_30m_cog.tif"                 # single-band elevation raster with CRS and nodata
+  pilot_area: "data/input/bacia_rio_xingu.gpkg" # polygon layer(s); multiple polygons are dissolved
+  pilot_layer: null                   # optional GPKG layer name
   vertical_units: "meters"            # vertical unit of the DEM (documentation + HAND threshold unit)
 
 processing:
-  buffer_distance: 5000               # context buffer around the pilot area
+  buffer_distance: 0               # context buffer around the pilot area
   buffer_units: "meters"              # "meters" or "cells"
   conditioning:
     method: "breach"                  # "breach" (BreachDepressions) or "fill" (FillDepressionsWangAndLiu)
@@ -18,9 +18,9 @@ processing:
     algorithm: "d8"                   # only D8 is supported
   drainage:
     threshold_type: "area_km2"        # "cells" or "area_km2"
-    threshold_value: 100              # minimum contributing cells or km2 to define drainage
+    threshold_value: 5000          # minimum contributing cells or km2 to define drainage
   hand:
-    threshold: 7.5                      # same vertical unit as the DEM
+    threshold: 1600                      # same vertical unit as the DEM
 
 outputs:
   directory: "outputs"
