@@ -65,7 +65,7 @@ See `config/example.yaml`. Every scientific parameter is **required**; unknown k
 
 | Key | Required | Units / values | Notes |
 |---|---|---|---|
-| `inputs.dem`, `inputs.pilot_area` | yes | paths | |
+| `inputs.dem`, `inputs.pilot_area` | yes | paths | `pilot_area: null` processes the whole DEM footprint |
 | `inputs.pilot_layer` | no | layer name or `null` | warning if the GPKG has several layers and none is named |
 | `inputs.vertical_units` | yes | `meters`, `centimeters`, `decimeters`, `feet`, `us_survey_feet` | documents the unit of DEM and HAND threshold |
 | `processing.buffer_distance` | yes | `>= 0`, in `buffer_units` | context around the pilot area |
@@ -78,9 +78,14 @@ See `config/example.yaml`. Every scientific parameter is **required**; unknown k
 | `outputs.directory` | yes | path | |
 | `outputs.intermediates`, `outputs.final` | no (`intermediate`, `final`) | relative names | must differ, no `..` |
 | `outputs.save_*` | no (`true`) | bool | `false` deletes that intermediate after the run |
-| `execution.overwrite` | no (`false`) | bool | conflicts are checked **before** any processing |
+| `execution.overwrite` | no (`false`) | bool | start from scratch; conflicts are checked **before** any processing |
+| `execution.resume` | no (`false`) | bool | reuse up-to-date stages of a previous run (section 10). Mutually exclusive with `overwrite` |
 | `execution.verbose` | no (`true`) | bool | DEBUG vs INFO logging |
 | `execution.whitebox_executable` | no | path | |
+| `execution.whitebox_version` | no | e.g. `"2.4.0"` | exact WhiteboxTools version required; without it a warning is recorded for versions not covered by the tests |
+| `execution.max_procs` | no | integer >= 1 | passed to WhiteboxTools as `--max_procs`; many of its tools are single-threaded, so the effect depends on the tool |
+| `execution.heartbeat_seconds` | no (`300`) | seconds >= 1 | interval of the progress message while a long WhiteboxTools run is active |
+| `execution.scratch_directory` | no | path | fast local disk for the *raw* WhiteboxTools outputs (see section 10) |
 
 ## 6. Processing methodology
 
@@ -155,7 +160,42 @@ whole processing extent (pilot + buffer); only the final product is clipped. `pr
 The summary stores the effective configuration, the SHA-256 of the YAML file, input paths, software versions (Python, numpy,
 rasterio, GDAL, geopandas, shapely, pyproj, PyYAML, `whitebox` package, WhiteboxTools binary), every WhiteboxTools call (tool,
 flags, exit status), UTC timestamps, warnings and limitations. Output organisation is fixed as shown above.
-Reusing `hand.tif` to try another HAND threshold is possible manually; no caching system is implemented.
+Stage fingerprints and the durations/peak memory of every stage and WhiteboxTools call are stored too (section 10).
+
+## 10. Large rasters, resume and monitoring (v0.2.0)
+
+Developed after a run on a ~917 M-cell DEM (18 993 x 48 316) that failed in `D8Pointer`.
+
+**WhiteboxTools outputs are rewritten by GDAL.** Each raster written by WhiteboxTools (to a raw file in the working
+directory) is copied block by block by GDAL into its final name (same grid, dtype, nodata, CRS, uncompressed GeoTIFF/BigTIFF)
+before any other tool reads it. Reason: WhiteboxTools 2.4.0 could not read its own 3.7 GB `conditioned_dem.tif`
+(`Error converting TAG(34737) to ASCII` in `whitebox-raster/.../ifd.rs`) although GDAL read it correctly, while it did read a
+GDAL-written file of the same size. The root cause inside WhiteboxTools was **not** confirmed; the rewrite is a workaround
+that follows from that observation and has been tested here only with the 2.0.0 binary (where the failure does not occur).
+
+**Memory.** Validation, statistics and the final mask are computed on full-width row stripes (`rasters.BLOCK_BYTES`, 192 MB),
+so Python memory does not grow with the raster. Measured here (synthetic data): 0.42 GiB peak at 180 M cells; the previous
+whole-array code needed 1.11 GiB at 36 M cells (about 31 bytes per cell). WhiteboxTools itself still loads whole rasters;
+its memory is sampled and reported per call. HAND percentiles come from a 100 000-bin histogram (error <= one bin width,
+reported in the summary); other statistics are exact.
+
+**Resume.** `execution.resume: true` reuses a stage when its fingerprint (relevant parameters, upstream fingerprints, DEM path/size/mtime,
+window, WhiteboxTools and package version) matches `stage_manifest.json` and its output files exist with the recorded size.
+Examples: changing `hand.threshold` re-runs only the final stage; changing the drainage threshold re-runs drainage and HAND;
+changing the DEM, window, conditioning method or WhiteboxTools version re-runs what depends on it. A failed or interrupted run
+keeps its completed stages. Limits: the DEM is identified by path/size/mtime, not content hash; hand-edited intermediates are
+only detected through their size. With `save_*: false` a deleted intermediate is recomputed only if a later stage needs it.
+
+**Monitoring.** The log shows, per stage, elapsed time and peak memory; during WhiteboxTools runs it prints a heartbeat every
+`heartbeat_seconds` (elapsed time, tool memory) and streams the tool output to DEBUG. Before heavy work a pre-flight estimate
+(raster size, disk needed vs free, available memory/container limit, CPUs) is logged and warnings are recorded. The conditioning
+diagnostics include the distribution of elevation decreases (approximate p50/p95/p99 and the number of cells lowered by more than
+1, 5, 10, 25 and 50 vertical units). `processing_summary.json` has `preflight`, `performance`, `whitebox_calls` (seconds and sampled
+memory) and `stages_reused_from_previous_run`.
+
+**Practical.** Run long jobs detached (`nohup ... &` or `tmux`) so a closed Jupyter session cannot kill them. Check
+`cat /sys/fs/cgroup/memory.max`: the container limit may be below the machine's RAM. Point `outputs.directory` (and optionally
+`execution.scratch_directory`) to local disk if the input lives on a network file system.
 
 ## 11. Tests
 
@@ -163,5 +203,5 @@ Reusing `hand.tif` to try another HAND threshold is possible manually; no cachin
 pytest                    # all tests
 pytest -m "not wbt"       # skip tests that need the WhiteboxTools executable
 ```
-Tests use synthetic rasters only. Tests marked `wbt` run the real executable (they are skipped if it is not found);
+Tests use synthetic rasters only (131 tests, including resume scenarios, stripe-independence of every block-wise stage and the GDAL rewrite). Tests marked `wbt` run the real executable (they are skipped if it is not found);
 failure propagation is tested with a fake executable (`tests/fake_wbt.py`).

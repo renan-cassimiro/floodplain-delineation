@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import platform
 import sys
@@ -30,6 +31,10 @@ REQUIRED_NAMES = {
 }
 FINAL_NAME = "potential_floodplain.tif"
 EXTENT_NAME = "dem_processing_extent.tif"
+MANIFEST_FILE = "stage_manifest.json"
+
+#: Files that are always regenerated, also when resuming a previous run.
+REGENERATED = ("potential_floodplain", "processing_summary", "processing_area")
 
 
 @dataclass(frozen=True)
@@ -56,6 +61,7 @@ def plan_outputs(config: Config) -> OutputPlan:
     paths["processing_summary"] = o.directory / "processing_summary.json"
     paths["processing_log"] = o.directory / "processing.log"
     paths["processing_area"] = o.directory / "processing_area.gpkg"
+    paths["stage_manifest"] = o.directory / MANIFEST_FILE
     flags = {
         "conditioned_dem": o.save_conditioned_dem,
         "flow_direction": o.save_flow_direction,
@@ -63,25 +69,40 @@ def plan_outputs(config: Config) -> OutputPlan:
         "drainage_network": o.save_drainage_network,
         "hand": o.save_hand,
     }
-    return OutputPlan(o.directory, inter, final, inter / ".wbt_tmp", paths, flags)
+    scratch = config.execution.scratch_directory
+    if scratch is not None:  # one sub-directory per output directory, so parallel runs never collide
+        tag = hashlib.sha1(str(o.directory).encode("utf-8")).hexdigest()[:8]
+        work_dir = scratch / f"{config.project_name}_{tag}"
+    else:
+        work_dir = inter / ".wbt_tmp"
+    return OutputPlan(o.directory, inter, final, work_dir, paths, flags)
 
 
 def prepare_output_dirs(plan: OutputPlan, config: Config) -> None:
-    """Check conflicts (inputs / existing files) BEFORE any processing, then create directories."""
+    """Check conflicts (inputs / existing files) BEFORE any processing, then create directories.
+
+    * default: any existing output file is an error;
+    * ``execution.overwrite``: existing outputs are deleted (start from scratch);
+    * ``execution.resume``: stage rasters and the manifest are kept (the pipeline decides, per stage,
+      whether they are still up to date); the summary, the processing-area layer and the final map
+      are regenerated.
+    Leftovers of an interrupted run (raw WhiteboxTools outputs, partial files) are always removed.
+    """
 
     inputs = {config.inputs.dem.resolve()}
-
     if config.inputs.pilot_area is not None:
         inputs.add(Path(config.inputs.pilot_area).resolve())
-        
+
     clash = [p for p in plan.all_files if p.resolve() in inputs]
     if clash:
         raise OutputError(f"Output path(s) coincide with input files: {clash}. Change outputs.directory.")
     existing = [p for p in plan.all_files if p.exists()]
-    if existing and not config.execution.overwrite:
+    resume, overwrite = config.execution.resume, config.execution.overwrite
+    if existing and not (overwrite or resume):
         names = ", ".join(str(p) for p in existing[:6]) + (" ..." if len(existing) > 6 else "")
         raise OutputError(
-            f"Output file(s) already exist: {names}. Set execution.overwrite: true or choose another "
+            f"Output file(s) already exist: {names}. Set execution.resume: true to reuse the up-to-date results "
+            "of the previous run, execution.overwrite: true to start from scratch, or choose another "
             "outputs.directory."
         )
     try:
@@ -92,12 +113,22 @@ def prepare_output_dirs(plan: OutputPlan, config: Config) -> None:
         probe.unlink()
     except OSError as exc:
         raise OutputError(f"Output directory {plan.root} is not writable: {exc}") from exc
-    for p in existing:  # only reached when overwrite is true
-        try:
-            p.unlink()
-        except OSError as exc:
-            raise OutputError(f"Cannot overwrite {p}: {exc}") from exc
-    plan.work_dir.mkdir(parents=True, exist_ok=True)
+    regenerated = {plan.paths[k] for k in REGENERATED}
+    for p in existing:
+        if overwrite or (resume and p in regenerated):
+            try:
+                p.unlink()
+            except OSError as exc:
+                raise OutputError(f"Cannot overwrite {p}: {exc}") from exc
+    try:
+        plan.work_dir.mkdir(parents=True, exist_ok=True)
+        stale = list(plan.work_dir.glob("*")) + list(plan.intermediate_dir.glob("*.partial"))
+        stale += list(plan.final_dir.glob("*.partial"))
+        for f in stale:
+            if f.is_file():
+                f.unlink()
+    except OSError as exc:
+        raise OutputError(f"Cannot prepare the working directory {plan.work_dir}: {exc}") from exc
 
 
 def cleanup(plan: OutputPlan) -> List[str]:

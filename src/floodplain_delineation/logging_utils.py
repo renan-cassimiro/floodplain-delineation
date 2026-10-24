@@ -19,11 +19,12 @@ def get_logger(name: Optional[str] = None) -> logging.Logger:
     return logging.getLogger(f"{LOGGER_NAME}.{name}" if name else LOGGER_NAME)
 
 
-def setup_logging(log_file: Optional[Path] = None, verbose: bool = True) -> logging.Logger:
+def setup_logging(log_file: Optional[Path] = None, verbose: bool = True, append: bool = False) -> logging.Logger:
     """Configure the package logger (console and optional file).
 
     Existing handlers are replaced so repeated calls (e.g. in tests) do not
-    duplicate messages. ``verbose`` selects DEBUG instead of INFO.
+    duplicate messages. ``verbose`` selects DEBUG instead of INFO. ``append`` keeps the
+    existing log file (used when resuming a run) instead of truncating it.
     """
     logger = logging.getLogger(LOGGER_NAME)
     for handler in list(logger.handlers):
@@ -38,7 +39,7 @@ def setup_logging(log_file: Optional[Path] = None, verbose: bool = True) -> logg
     logger.addHandler(console)
 
     if log_file is not None:
-        file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
+        file_handler = logging.FileHandler(log_file, mode="a" if append else "w", encoding="utf-8")
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
     return logger

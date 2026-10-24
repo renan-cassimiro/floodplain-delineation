@@ -49,7 +49,8 @@ def test_drainage_diagnostics_length_and_percentage(tmp_path, utm_cell):
     drain[2, 3:5] = 1; ptr[2, 3:5] = 4
     drain[3, 5] = 255                       # nodata cell excluded from the percentage
     p = write_dem(tmp_path / "ptr.tif", ptr, nodata=-32768)
-    d = drainage_diagnostics(drain, p, utm_cell)
+    dpath = write_dem(tmp_path / "drain.tif", drain, nodata=255)
+    d = drainage_diagnostics(dpath, p, utm_cell)
     assert d["drainage_cells"] == 5 and d["valid_cells"] == 23
     assert d["percent_of_processing_area"] == pytest.approx(100 * 5 / 23)
     assert d["approx_length_km"] == pytest.approx((3 * 30 + 2 * 30 * math.sqrt(2)) / 1000)

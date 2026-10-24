@@ -1,4 +1,5 @@
 import copy
+from pathlib import Path
 
 import pytest
 import yaml
@@ -124,3 +125,40 @@ def test_section_must_be_mapping(base_cfg):
     base_cfg["inputs"] = ["dem.tif"]
     with pytest.raises(ConfigError, match="mapping"):
         parse_config(base_cfg)
+
+
+# ------------------------------- execution options for large runs / resume -------------------------------
+def test_execution_defaults_for_new_options(base_cfg):
+    ex = parse_config(base_cfg).execution
+    assert (ex.resume, ex.max_procs, ex.heartbeat_seconds, ex.whitebox_version, ex.scratch_directory) == (False, None, 300.0, None, None)
+
+
+def test_execution_new_options_are_validated_and_echoed(base_cfg, tmp_path):
+    base_cfg["execution"].update({"resume": True, "max_procs": 18, "heartbeat_seconds": 60,
+                                  "whitebox_version": "2.4.0", "scratch_directory": str(tmp_path / "scratch")})
+    cfg = parse_config(base_cfg)
+    eff = cfg.to_dict()["execution"]
+    assert eff["resume"] is True and eff["max_procs"] == 18 and eff["whitebox_version"] == "2.4.0"
+    assert eff["scratch_directory"] == str((tmp_path / "scratch").resolve())
+
+
+@pytest.mark.parametrize("key, value", [("max_procs", 0), ("max_procs", 2.5), ("max_procs", "all"), ("heartbeat_seconds", 0),
+                                        ("resume", "yes"), ("whitebox_version", 2.4)])
+def test_execution_new_options_reject_bad_values(base_cfg, key, value):
+    base_cfg["execution"][key] = value
+    with pytest.raises(ConfigError):
+        parse_config(base_cfg)
+
+
+def test_overwrite_and_resume_are_mutually_exclusive(base_cfg):
+    base_cfg["execution"].update({"overwrite": True, "resume": True})
+    with pytest.raises(ConfigError, match="cannot both be true"):
+        parse_config(base_cfg)
+
+
+def test_pilot_area_is_optional_and_path_typed(base_cfg):
+    cfg = parse_config(base_cfg)
+    assert isinstance(cfg.inputs.pilot_area, Path)
+    base_cfg["inputs"]["pilot_area"] = None
+    cfg = parse_config(base_cfg)
+    assert cfg.inputs.pilot_area is None and cfg.to_dict()["inputs"]["pilot_area"] is None

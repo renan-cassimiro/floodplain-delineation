@@ -35,7 +35,7 @@ DEFAULT_PROJECT_NAME = "potential_floodplain_delineation"
 @dataclass(frozen=True)
 class InputsConfig:
     dem: Path
-    pilot_area: Path
+    pilot_area: Optional[Path]   # None: the whole DEM footprint is processed
     pilot_layer: Optional[str]
     vertical_units: str
 
@@ -68,6 +68,11 @@ class ExecutionConfig:
     overwrite: bool
     verbose: bool
     whitebox_executable: Optional[Path]
+    resume: bool = False                       # reuse up-to-date stage outputs of a previous run
+    max_procs: Optional[int] = None            # passed to WhiteboxTools as --max_procs (None: tool default)
+    heartbeat_seconds: float = 300.0           # progress message interval for long WhiteboxTools runs
+    whitebox_version: Optional[str] = None     # exact WhiteboxTools version required (e.g. "2.4.0")
+    scratch_directory: Optional[Path] = None   # where raw WhiteboxTools outputs are written (fast local disk)
 
 
 @dataclass(frozen=True)
@@ -88,7 +93,7 @@ class Config:
             "project": {"name": self.project_name},
             "inputs": {
                 "dem": str(self.inputs.dem),
-                "pilot_area": str(self.inputs.pilot_area),
+                "pilot_area": str(self.inputs.pilot_area) if self.inputs.pilot_area else None,
                 "pilot_layer": self.inputs.pilot_layer,
                 "vertical_units": self.inputs.vertical_units,
             },
@@ -120,6 +125,13 @@ class Config:
                     str(self.execution.whitebox_executable)
                     if self.execution.whitebox_executable
                     else None
+                ),
+                "resume": self.execution.resume,
+                "max_procs": self.execution.max_procs,
+                "heartbeat_seconds": self.execution.heartbeat_seconds,
+                "whitebox_version": self.execution.whitebox_version,
+                "scratch_directory": (
+                    str(self.execution.scratch_directory) if self.execution.scratch_directory else None
                 ),
             },
         }
@@ -222,7 +234,7 @@ def parse_config(data: Any, *, source_path: Optional[Path] = None, source_sha256
     inp = _section(top["inputs"], "inputs", ("dem", "pilot_area", "vertical_units"), ("pilot_layer",))
     inputs = InputsConfig(
         dem=_path(inp["dem"], "inputs.dem"),
-        pilot_area=_string(inp["pilot_area"], "inputs.pilot_area", allow_none=True),
+        pilot_area=_path(inp["pilot_area"], "inputs.pilot_area") if inp["pilot_area"] is not None else None,
         pilot_layer=_string(inp.get("pilot_layer"), "inputs.pilot_layer", allow_none=True),
         vertical_units=_choice(inp["vertical_units"], "inputs.vertical_units", VERTICAL_UNITS),
     )
@@ -285,13 +297,39 @@ def parse_config(data: Any, *, source_path: Optional[Path] = None, source_sha256
         save_hand=_boolean(out.get("save_hand", True), "outputs.save_hand"),
     )
 
-    ex = _section(top.get("execution", {}), "execution", (), ("overwrite", "verbose", "whitebox_executable"))
+    ex = _section(
+        top.get("execution", {}),
+        "execution",
+        (),
+        (
+            "overwrite", "verbose", "whitebox_executable", "resume", "max_procs",
+            "heartbeat_seconds", "whitebox_version", "scratch_directory",
+        ),
+    )
     wbt_exe = ex.get("whitebox_executable")
+    scratch = ex.get("scratch_directory")
+    max_procs = ex.get("max_procs")
+    if max_procs is not None:
+        max_procs = _number(max_procs, "execution.max_procs", minimum=1.0, inclusive=True)
+        if max_procs != int(max_procs):
+            raise ConfigError(f"'execution.max_procs' must be a whole number, got {max_procs:g}.")
+        max_procs = int(max_procs)
+    wbt_version = _string(ex.get("whitebox_version"), "execution.whitebox_version", allow_none=True)
     execution = ExecutionConfig(
         overwrite=_boolean(ex.get("overwrite", False), "execution.overwrite"),
         verbose=_boolean(ex.get("verbose", True), "execution.verbose"),
         whitebox_executable=_path(wbt_exe, "execution.whitebox_executable") if wbt_exe is not None else None,
+        resume=_boolean(ex.get("resume", False), "execution.resume"),
+        max_procs=max_procs,
+        heartbeat_seconds=_number(ex.get("heartbeat_seconds", 300), "execution.heartbeat_seconds", minimum=1.0, inclusive=True),
+        whitebox_version=wbt_version,
+        scratch_directory=_path(scratch, "execution.scratch_directory") if scratch is not None else None,
     )
+    if execution.overwrite and execution.resume:
+        raise ConfigError(
+            "'execution.overwrite' and 'execution.resume' cannot both be true: overwrite restarts from "
+            "scratch, resume reuses the up-to-date results of a previous run. Choose one."
+        )
 
     return Config(
         project_name=project_name,

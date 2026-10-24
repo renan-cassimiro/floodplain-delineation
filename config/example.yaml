@@ -33,6 +33,11 @@ outputs:
   save_hand: true
 
 execution:
-  overwrite: false
+  overwrite: false                  # true: start from scratch (excludes resume)
+  resume: false                     # true: reuse up-to-date stages of a previous run (after a failure, or to change only the HAND/drainage threshold)
   verbose: true
+  # max_procs: 18                   # passed to WhiteboxTools (--max_procs); most of its tools are single-threaded
+  # heartbeat_seconds: 300          # progress message interval during long WhiteboxTools runs
+  # whitebox_version: "2.4.0"       # require exactly this WhiteboxTools version
+  # scratch_directory: "/tmp/fp_scratch"   # fast local disk for raw WhiteboxTools outputs
   # whitebox_executable: "/path/to/whitebox_tools"   # optional; auto-detected otherwise
