@@ -38,6 +38,8 @@ from .outputs import (
 )
 from .preflight import run_preflight
 from .preprocessing import CONDITIONING_TOOLS, condition_dem, extract_processing_dem
+from .reprojection import reproject_dem
+from .rem import compute_rem
 from .rasters import GridInfo
 from .spatial import cell_geometry
 from .stages import StageExecutor, StageSpec
@@ -130,24 +132,36 @@ def _run_pipeline(config: Config) -> Dict[str, Any]:
         )
         wbt_version = runner.version()
         tool_name = CONDITIONING_TOOLS[p.conditioning_method][0]
-        runner.verify_tools([tool_name, "D8Pointer", "D8FlowAccumulation", "ExtractStreams", "ElevationAboveStream"])
+        required_tools = [tool_name, "D8Pointer", "D8FlowAccumulation", "ExtractStreams", "ElevationAboveStream"]
+        if p.rem_enabled:
+            required_tools.append("Basins")
+        runner.verify_tools(required_tools)
         log.info("Using %s", wbt_version)
         _check_wbt_version(config.execution.whitebox_version, wbt_version, warnings)
 
-        # --- Stage 1 ---------------------------------------------------------
-        log.info("Stage 1: input validation and spatial preparation")
-        dem = read_dem_info(config.inputs.dem, warnings)
+        # --- Stage 0: global DEM reprojection -------------------------------
+        log.info("Stage 0: validating source DEM and reprojecting to processing CRS %s", p.crs)
+        source_dem_info = read_dem_info(config.inputs.dem, warnings)
+        reproj_info = reproject_dem(config.inputs.dem, plan.paths["dem_reprojected"], p.crs,
+                                    p.target_resolution, p.dem_resampling, resume=config.execution.resume)
+        dem = read_dem_info(plan.paths["dem_reprojected"], warnings)
         domain = prepare_spatial_domain(dem, config, warnings)
         cell = cell_geometry(dem.pcrs, domain.window_transform, domain.extent_bounds)
         write_processing_area(plan.paths["processing_area"], domain, dem.crs)
         win_w, win_h = int(domain.window.width), int(domain.window.height)
         grid = GridInfo(win_h, win_w, domain.window_transform, dem.crs)
         summary["spatial"] = {
+            "source_dem": str(config.inputs.dem),
+            "source_dem_crs": source_dem_info.crs.to_string(),
             "dem_crs": dem.crs.to_string(),
             "pilot_source_crs": domain.source_crs,
             "output_crs": dem.crs.to_string(),
-            "reprojection_note": "Only the pilot geometry is reprojected (to the DEM CRS); the DEM is never reprojected or resampled.",
+            "reprojection": reproj_info,
+            "reprojection_note": "The DEM is reprojected before any hydrological processing; all derived rasters share the processing grid.",
             "dem_resolution_crs_units": list(dem.resolution),
+            "processing_crs_requested": p.crs,
+            "target_resolution_requested": p.target_resolution,
+            "dem_resampling": p.dem_resampling,
             "cell_size_m": [cell.dx_m, cell.dy_m],
             "cell_area_km2": cell.area_km2,
             "vertical_units": config.inputs.vertical_units,
@@ -177,7 +191,7 @@ def _run_pipeline(config: Config) -> Dict[str, Any]:
         common = {"package": __version__}
         fp_ext = fingerprint(
             "dem_extraction",
-            {**common, "dem": file_signature(config.inputs.dem), "window": [int(domain.window.col_off),
+            {**common, "dem": file_signature(paths["dem_reprojected"]), "crs": p.crs, "resolution": list(dem.resolution), "window": [int(domain.window.col_off),
              int(domain.window.row_off), win_w, win_h]},
         )
         fp_cond = fingerprint("conditioning", {**common, "method": p.conditioning_method, "tool": tool_name, "wbt": wbt_id}, [fp_ext])
@@ -233,8 +247,29 @@ def _run_pipeline(config: Config) -> Dict[str, Any]:
         ):
             executor.add(spec)
 
+        fp_rem = fingerprint(
+            "rem_basin_idw",
+            {**common, "sampling_interval_pixels": p.rem_sampling_interval_pixels,
+             "idw_power": p.rem_idw_power, "method": "euclidean_all_samples_per_basins_region"},
+            [fp_cond, fp_dir, fp_drain],
+        )
+
+        def run_rem() -> Dict[str, Any]:
+            return compute_rem(
+                runner, paths["conditioned_dem"], paths["drainage_network"], paths["flow_direction"],
+                paths["basins"], paths["rem_surface"], paths["rem"], work,
+                p.rem_sampling_interval_pixels, p.rem_idw_power, warnings,
+            )
+
+        if p.rem_enabled:
+            executor.add(StageSpec("rem", "basin-wise IDW REM",
+                                   [paths["basins"], paths["rem_surface"], paths["rem"]],
+                                   fp_rem, ["conditioning", "flow_direction", "drainage"], run_rem))
+
         log.info("Stages 2-5: extraction, conditioning, flow routing, drainage, HAND")
         executor.ensure("hand")
+        if p.rem_enabled:
+            executor.ensure("rem")
         executor.collect_reused(list(executor.specs))
         cached_ext = executor.result("dem_extraction") or {}
         if "dem_extraction" in executor.reused and cached_ext.get("pilot_signature") != pilot_sig:
@@ -249,6 +284,8 @@ def _run_pipeline(config: Config) -> Dict[str, Any]:
         final = build_final_mask(paths["hand"], domain.pilot, p.hand_threshold,
                                  paths["potential_floodplain"], config.inputs.vertical_units, cell)
         executor.timings["floodplain"] = {"status": "run", "seconds": round(time.monotonic() - t_final, 2)}
+        if p.rem_enabled:
+            summary["stages"]["rem"] = executor.result("rem") or {}
         summary["stages"]["floodplain"] = {
             "hand_threshold": p.hand_threshold, "hand_threshold_units": config.inputs.vertical_units, **final,
         }
@@ -299,6 +336,8 @@ def _run_pipeline(config: Config) -> Dict[str, Any]:
                     summary["stages"]["drainage"] = res["drainage"]
                 if res.get("hand"):
                     summary["stages"]["hand"] = res["hand"]
+                if res.get("rem"):
+                    summary["stages"]["rem"] = res["rem"]
                 summary["stages_reused_from_previous_run"] = list(executor.reused)
                 summary["performance"] = {
                     "total_seconds": round(time.monotonic() - t_start, 2),

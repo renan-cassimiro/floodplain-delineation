@@ -1,9 +1,10 @@
 """Stage 1: input validation and spatial preparation.
 
 * Validates files, DEM metadata and the pilot-area geometry.
-* Reprojects the pilot geometry to the DEM CRS (explicit; the DEM is never reprojected).
+* Reprojects the pilot geometry to the processing DEM CRS. The DEM has already been
+  reprojected to the configured master grid before this module is called.
 * Computes the processing extent (pilot area + context buffer) as an integer pixel
-  window of the original DEM grid, so no resampling ever happens.
+  window of the master grid.
 """
 
 from __future__ import annotations

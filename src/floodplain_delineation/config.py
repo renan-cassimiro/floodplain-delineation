@@ -49,6 +49,12 @@ class ProcessingConfig:
     drainage_threshold_type: str
     drainage_threshold_value: float
     hand_threshold: float
+    crs: str = "ESRI:102033"
+    target_resolution: Optional[float] = None
+    dem_resampling: str = "bilinear"
+    rem_enabled: bool = False
+    rem_sampling_interval_pixels: int = 10
+    rem_idw_power: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -107,6 +113,8 @@ class Config:
                     "threshold_value": p.drainage_threshold_value,
                 },
                 "hand": {"threshold": p.hand_threshold},
+                "crs": p.crs, "target_resolution": p.target_resolution, "dem_resampling": p.dem_resampling,
+                "rem": {"enabled": p.rem_enabled, "sampling_interval_pixels": p.rem_sampling_interval_pixels, "idw_power": p.rem_idw_power},
             },
             "outputs": {
                 "directory": str(o.directory),
@@ -243,12 +251,23 @@ def parse_config(data: Any, *, source_path: Optional[Path] = None, source_sha256
         top["processing"],
         "processing",
         ("buffer_distance", "conditioning", "flow", "drainage", "hand"),
-        ("buffer_units",),
+        ("buffer_units", "crs", "target_resolution", "dem_resampling", "rem"),
     )
     cond = _section(proc["conditioning"], "processing.conditioning", ("method",))
     flow = _section(proc["flow"], "processing.flow", ("algorithm",))
     drain = _section(proc["drainage"], "processing.drainage", ("threshold_type", "threshold_value"))
     hand = _section(proc["hand"], "processing.hand", ("threshold",))
+    rem = _section(proc.get("rem", {}), "processing.rem", (), ("enabled", "sampling_interval_pixels", "idw_power"))
+    rem_enabled = _boolean(rem.get("enabled", False), "processing.rem.enabled")
+    rem_interval = _number(rem.get("sampling_interval_pixels", 10), "processing.rem.sampling_interval_pixels", minimum=1, inclusive=True)
+    if rem_interval != int(rem_interval):
+        raise ConfigError("processing.rem.sampling_interval_pixels must be a positive integer.")
+    rem_power = _number(rem.get("idw_power", 2.0), "processing.rem.idw_power", minimum=0.0, inclusive=False)
+    target_resolution = proc.get("target_resolution")
+    if target_resolution is not None:
+        target_resolution = _number(target_resolution, "processing.target_resolution", minimum=0.0, inclusive=False)
+    crs = _string(proc.get("crs", "ESRI:102033"), "processing.crs")
+    dem_resampling = _choice(proc.get("dem_resampling", "bilinear"), "processing.dem_resampling", ("nearest", "bilinear", "cubic"))
 
     threshold_type = _choice(drain["threshold_type"], "processing.drainage.threshold_type", DRAINAGE_THRESHOLD_TYPES)
     threshold_value = _number(drain["threshold_value"], "processing.drainage.threshold_value", minimum=0.0, inclusive=False)
@@ -266,6 +285,8 @@ def parse_config(data: Any, *, source_path: Optional[Path] = None, source_sha256
         drainage_threshold_type=threshold_type,
         drainage_threshold_value=threshold_value,
         hand_threshold=_number(hand["threshold"], "processing.hand.threshold", minimum=0.0, inclusive=True),
+        crs=crs, target_resolution=target_resolution, dem_resampling=dem_resampling,
+        rem_enabled=rem_enabled, rem_sampling_interval_pixels=int(rem_interval), rem_idw_power=rem_power,
     )
 
     out = _section(

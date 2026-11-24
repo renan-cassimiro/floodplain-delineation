@@ -28,6 +28,9 @@ REQUIRED_NAMES = {
     "flow_accumulation": "flow_accumulation.tif",
     "drainage_network": "drainage_network.tif",
     "hand": "hand.tif",
+    "basins": "basins.tif",
+    "rem_surface": "rem_drainage_surface.tif",
+    "rem": "rem.tif",
 }
 FINAL_NAME = "potential_floodplain.tif"
 EXTENT_NAME = "dem_processing_extent.tif"
@@ -55,7 +58,7 @@ def plan_outputs(config: Config) -> OutputPlan:
     o = config.outputs
     inter = o.directory / o.intermediates
     final = o.directory / o.final
-    paths = {"dem_processing_extent": inter / EXTENT_NAME}
+    paths = {"dem_processing_extent": inter / EXTENT_NAME, "dem_reprojected": inter / "dem_processing_crs.tif"}
     paths.update({k: inter / v for k, v in REQUIRED_NAMES.items()})
     paths["potential_floodplain"] = final / FINAL_NAME
     paths["processing_summary"] = o.directory / "processing_summary.json"
@@ -68,6 +71,9 @@ def plan_outputs(config: Config) -> OutputPlan:
         "flow_accumulation": o.save_flow_accumulation,
         "drainage_network": o.save_drainage_network,
         "hand": o.save_hand,
+        "basins": config.processing.rem_enabled,
+        "rem_surface": config.processing.rem_enabled,
+        "rem": config.processing.rem_enabled,
     }
     scratch = config.execution.scratch_directory
     if scratch is not None:  # one sub-directory per output directory, so parallel runs never collide

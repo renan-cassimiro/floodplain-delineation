@@ -41,7 +41,7 @@ _DECREASE_EDGES = np.logspace(-3, 4, 141)
 def extract_processing_dem(
     dem: DemInfo, domain: SpatialDomain, out_path: Path, warnings: WarningCollector
 ) -> Dict[str, Any]:
-    """Write the unconditioned DEM over the processing window (original grid, no resampling).
+    """Write the unconditioned DEM over the processing window (processing CRS master grid).
 
     Valid values are copied unchanged. Integer DEMs are stored as float32 (lossless for
     elevation ranges); a NaN nodata is replaced by an explicit finite sentinel.

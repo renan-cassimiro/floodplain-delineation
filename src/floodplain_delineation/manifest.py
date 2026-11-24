@@ -30,7 +30,7 @@ from .logging_utils import get_logger
 log = get_logger("manifest")
 
 #: Bump when stage outputs change meaning, so older manifests are never reused.
-MANIFEST_SCHEMA = 2
+MANIFEST_SCHEMA = 3
 
 MANIFEST_NAME = "stage_manifest.json"
 

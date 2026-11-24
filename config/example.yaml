@@ -4,8 +4,8 @@ project:
   name: "potential_floodplain_delineation"
 
 inputs:
-  dem: "../../grupos/inpa/abiotic_data/amazon_basin/uhe2025/processed/fathomdem/amazon_basin_fathomdem_30m_cog/amazon_basin_fathomdem_30m_cog.tif"                 # single-band elevation raster with CRS and nodata
-  pilot_area: "data/input/bacia_rio_xingu.gpkg" # polygon layer(s); multiple polygons are dissolved
+  dem: "data/input/xingu_river/xingu_river_fathomdem_30m_cog.tif"                 # single-band elevation raster with CRS and nodata
+  pilot_area: "data/input/xingu_river/xingu_river_study_area_bounding_box.gpkg" # polygon layer(s); multiple polygons are dissolved
   pilot_layer: null                   # optional GPKG layer name
   vertical_units: "meters"            # vertical unit of the DEM (documentation + HAND threshold unit)
 
@@ -18,12 +18,19 @@ processing:
     algorithm: "d8"                   # only D8 is supported
   drainage:
     threshold_type: "area_km2"        # "cells" or "area_km2"
-    threshold_value: 5000          # minimum contributing cells or km2 to define drainage
+    threshold_value: 1000         # minimum contributing cells or km2 to define drainage
+  crs: "ESRI:102033"
+  target_resolution: null
+  dem_resampling: "bilinear"
+  rem:
+    enabled: true
+    sampling_interval_pixels: 20
+    idw_power: 2.0
   hand:
     threshold: 1600                      # same vertical unit as the DEM
 
 outputs:
-  directory: "outputs"
+  directory: "outputs/xingu_river"
   intermediates: "intermediate"
   final: "final"
   save_conditioned_dem: true
@@ -34,7 +41,7 @@ outputs:
 
 execution:
   overwrite: false                  # true: start from scratch (excludes resume)
-  resume: false                     # true: reuse up-to-date stages of a previous run (after a failure, or to change only the HAND/drainage threshold)
+  resume: true                     # true: reuse up-to-date stages of a previous run (after a failure, or to change only the HAND/drainage threshold)
   verbose: true
   # max_procs: 18                   # passed to WhiteboxTools (--max_procs); most of its tools are single-threaded
   # heartbeat_seconds: 300          # progress message interval during long WhiteboxTools runs
