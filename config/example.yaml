@@ -27,7 +27,7 @@ processing:
     sampling_interval_pixels: 20
     idw_power: 2.0
   hand:
-    threshold: 1600                      # same vertical unit as the DEM
+    threshold: 15                      # same vertical unit as the DEM
 
 outputs:
   directory: "outputs/xingu_river"

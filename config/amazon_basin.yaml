@@ -19,6 +19,13 @@ processing:
   drainage:
     threshold_type: "area_km2"        # "cells" or "area_km2"
     threshold_value: 20000          # minimum contributing cells or km2 to define drainage
+  crs: "ESRI:102033"
+  target_resolution: null
+  dem_resampling: "bilinear"
+  rem:
+    enabled: false
+    sampling_interval_pixels: 10
+    idw_power: 2.0
   hand:
     threshold: 16                      # same vertical unit as the DEM
 
