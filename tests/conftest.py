@@ -54,6 +54,7 @@ def config_dict(tmp_path: Path, dem: Path, gpkg: Path, **over):
         "processing": {
             "buffer_distance": 600,
             "buffer_units": "meters",
+            "crs": CRS,                       # fixtures are already in the processing CRS: window copy, no resampling
             "conditioning": {"method": "breach"},
             "flow": {"algorithm": "d8"},
             "drainage": {"threshold_type": "cells", "threshold_value": 150},

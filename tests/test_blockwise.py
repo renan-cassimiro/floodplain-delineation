@@ -13,7 +13,8 @@ from floodplain_delineation.delineation import apply_hand_threshold, build_final
 from floodplain_delineation.exceptions import ProcessingError
 from floodplain_delineation.inputs import prepare_spatial_domain, read_dem_info
 from floodplain_delineation.logging_utils import WarningCollector
-from floodplain_delineation.preprocessing import compare_conditioned, extract_processing_dem
+from floodplain_delineation.preprocessing import compare_conditioned
+from floodplain_delineation.reprojection import reproject_dem
 from floodplain_delineation.rasters import normalize_geotiff, row_stripes
 from floodplain_delineation.spatial import cell_geometry, to_pyproj
 
@@ -94,7 +95,7 @@ def _cfg(tmp_path, dem, gpkg, **over):
 
 
 @pytest.mark.parametrize("dtype, nodata", [("float32", NODATA), ("int16", -32768), ("float32", float("nan"))])
-def test_extraction_is_stripe_independent(tmp_path, tiny_blocks, dtype, nodata):
+def test_identity_reprojection_is_stripe_independent(tmp_path, tiny_blocks, dtype, nodata):
     rng = np.random.default_rng(1)
     arr = rng.integers(0, 500, (90, 70)).astype(dtype)
     arr[10:14, 20:30] = nodata
@@ -105,7 +106,7 @@ def test_extraction_is_stripe_independent(tmp_path, tiny_blocks, dtype, nodata):
     info = read_dem_info(dem, w)
     domain = prepare_spatial_domain(info, cfg, w)
     out = tmp_path / "ext.tif"
-    res = extract_processing_dem(info, domain, out, w)
+    res = reproject_dem(info, domain, out, "bilinear", w)
     with rasterio.open(dem) as s, rasterio.open(out) as o:
         ref = s.read(1, window=domain.window)
         got = o.read(1)

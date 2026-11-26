@@ -13,7 +13,7 @@ from floodplain_delineation.inputs import (
     prepare_spatial_domain, read_dem_info, read_pilot_geometry, validate_input_files,
 )
 from floodplain_delineation.logging_utils import WarningCollector
-from floodplain_delineation.preprocessing import extract_processing_dem
+from floodplain_delineation.reprojection import reproject_dem
 from floodplain_delineation.spatial import cell_geometry, to_pyproj
 
 
@@ -79,13 +79,13 @@ def dem_info(tmp_path):
 def test_empty_pilot_layer(tmp_path, dem_info):
     g = write_gpkg(tmp_path / "e.gpkg", [])
     with pytest.raises(InputError, match="no features"):
-        read_pilot_geometry(g, None, dem_info, WarningCollector())
+        read_pilot_geometry(g, None, dem_info.pcrs, WarningCollector())
 
 
 def test_non_polygon_pilot_layer(tmp_path, dem_info):
     g = write_gpkg(tmp_path / "pts.gpkg", [Point(X0 + 10, Y0 - 10)])
     with pytest.raises(InputError, match="no valid polygon"):
-        read_pilot_geometry(g, None, dem_info, WarningCollector())
+        read_pilot_geometry(g, None, dem_info.pcrs, WarningCollector())
 
 
 def test_pilot_without_crs(tmp_path, dem_info):
@@ -94,7 +94,7 @@ def test_pilot_without_crs(tmp_path, dem_info):
     g = tmp_path / "nocrs.gpkg"
     gpd.GeoDataFrame(geometry=[pilot_box(1, 1, 5, 5)]).to_file(g, driver="GPKG")
     with pytest.raises(InputError, match="no CRS"):
-        read_pilot_geometry(g, None, dem_info, WarningCollector())
+        read_pilot_geometry(g, None, dem_info.pcrs, WarningCollector())
 
 
 def test_invalid_polygon_is_repaired_with_warning(tmp_path, dem_info):
@@ -102,7 +102,7 @@ def test_invalid_polygon_is_repaired_with_warning(tmp_path, dem_info):
     assert not bowtie.is_valid
     g = write_gpkg(tmp_path / "bow.gpkg", [bowtie])
     w = WarningCollector()
-    geom, _, _ = read_pilot_geometry(g, None, dem_info, w)
+    geom, _, _ = read_pilot_geometry(g, None, dem_info.pcrs, w)
     assert geom.is_valid and geom.area > 0
     assert any("Repaired 1 invalid" in m for m in w.messages)
 
@@ -110,11 +110,11 @@ def test_invalid_polygon_is_repaired_with_warning(tmp_path, dem_info):
 def test_multiple_polygons_are_dissolved_and_layer_selection(tmp_path, dem_info):
     a, b = pilot_box(5, 5, 20, 20), pilot_box(15, 15, 40, 40)   # overlapping
     g = write_gpkg(tmp_path / "m.gpkg", [a, b], layer="L1")
-    geom, _, n = read_pilot_geometry(g, "L1", dem_info, WarningCollector())
+    geom, _, n = read_pilot_geometry(g, "L1", dem_info.pcrs, WarningCollector())
     assert n == 2 and geom.geom_type == "Polygon"
     assert geom.area == pytest.approx(a.union(b).area)
     with pytest.raises(InputError, match="Layer 'nope' not found"):
-        read_pilot_geometry(g, "nope", dem_info, WarningCollector())
+        read_pilot_geometry(g, "nope", dem_info.pcrs, WarningCollector())
 
 
 def test_pilot_crs_transformation_to_dem_crs(tmp_path, dem_info):
@@ -122,7 +122,7 @@ def test_pilot_crs_transformation_to_dem_crs(tmp_path, dem_info):
     original = pilot_box(10, 10, 40, 40)
     ll = shp_transform(to_ll, original)
     g = write_gpkg(tmp_path / "ll.gpkg", [ll], crs="EPSG:4326")
-    geom, src, _ = read_pilot_geometry(g, None, dem_info, WarningCollector())
+    geom, src, _ = read_pilot_geometry(g, None, dem_info.pcrs, WarningCollector())
     assert "4326" in src
     # round trip within a few centimetres
     assert geom.bounds == pytest.approx(original.bounds, abs=0.1)
@@ -154,7 +154,7 @@ def test_window_is_grid_aligned_and_includes_buffer(tmp_path):
     assert ((l - X0) / RES) == pytest.approx(round((l - X0) / RES))
     assert ((Y0 - t) / RES) == pytest.approx(round((Y0 - t) / RES))
     assert d.window_transform.a == RES and not d.truncated_sides
-    assert d.buffer_info["method"] == "dem_crs"
+    assert d.buffer_info["method"] == "processing_crs"
 
 
 def test_buffer_truncated_by_dem_edge_is_reported(tmp_path):
@@ -181,17 +181,20 @@ def test_zero_buffer_warns_and_cells_units(tmp_path):
     assert d.window.width >= 20 + 2 * 10
 
 
-def test_geographic_dem_buffer_is_computed_in_metres(tmp_path):
+def test_geographic_dem_buffer_is_computed_in_processing_crs_metres(tmp_path):
     res = 0.0009  # ~100 m
     arr = np.ones((200, 200), "float32")
     dem = write_dem(tmp_path / "geo.tif", arr, crs="EPSG:4326", transform=from_origin(-60.0, -3.0, res, res))
     pilot = box(-59.95, -3.15, -59.85, -3.05)
     g = write_gpkg(tmp_path / "gp.gpkg", [pilot], crs="EPSG:4326")
-    cfg = cfg_for(tmp_path, dem, g, **{"processing.buffer_distance": 5000})
+    cfg = cfg_for(tmp_path, dem, g, **{"processing.buffer_distance": 5000, "processing.crs": "EPSG:32721"})
     d = prepare_spatial_domain(read_dem_info(dem), cfg, WarningCollector())
-    assert d.buffer_info["method"] == "projected_crs" and "EPSG:327" in d.buffer_info["buffer_crs"]  # southern-hemisphere UTM
-    grew_deg = pilot.bounds[0] - d.requested_bounds[0]
-    assert grew_deg == pytest.approx(5000 / 111_320 / np.cos(np.radians(3.1)), rel=0.05)
+    assert d.buffer_info["method"] == "processing_crs" and d.buffer_info["distance_in_crs_units"] == 5000
+    assert d.grid.crs.to_epsg() == 32721 and not d.grid.identical_to_source
+    tr = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:32721", always_xy=True)
+    px0, py0 = tr.transform(pilot.bounds[0], pilot.bounds[1])
+    assert px0 - d.requested_bounds[0] == pytest.approx(5000, rel=0.02)   # grown by ~5 km on the west side
+    assert py0 - d.requested_bounds[1] == pytest.approx(5000, rel=0.02)
 
 
 # --------------------------- DEM extraction & nodata --------------------------- #
@@ -204,7 +207,7 @@ def test_extraction_preserves_values_nodata_grid(tmp_path):
     info, w = read_dem_info(dem), WarningCollector()
     d = prepare_spatial_domain(info, cfg, w)
     out = tmp_path / "extent.tif"
-    meta = extract_processing_dem(info, d, out, w)
+    meta = reproject_dem(info, d, out, "bilinear", w)
     with rasterio.open(out) as o, rasterio.open(dem) as s:
         assert o.crs == s.crs and o.nodata == NODATA and o.res == s.res
         sub = s.read(1, window=d.window)
@@ -219,7 +222,7 @@ def test_integer_dem_becomes_float32_and_nan_nodata_gets_sentinel(tmp_path):
     g = write_gpkg(tmp_path / "p.gpkg", [pilot_box(10, 10, 40, 40)])
     info, w = read_dem_info(dem), WarningCollector()
     d = prepare_spatial_domain(info, cfg_for(tmp_path, dem, g), w)
-    meta = extract_processing_dem(info, d, tmp_path / "o.tif", w)
+    meta = reproject_dem(info, d, tmp_path / "o.tif", "bilinear", w)
     assert meta["dtype"] == "float32"
 
     f = np.ones((50, 50), "float32")
@@ -227,7 +230,7 @@ def test_integer_dem_becomes_float32_and_nan_nodata_gets_sentinel(tmp_path):
     dem2 = write_dem(tmp_path / "n.tif", f, nodata=np.nan)
     info2 = read_dem_info(dem2)
     d2 = prepare_spatial_domain(info2, cfg_for(tmp_path, dem2, g), w)
-    extract_processing_dem(info2, d2, tmp_path / "o2.tif", w)
+    reproject_dem(info2, d2, tmp_path / "o2.tif", "bilinear", w)
     with rasterio.open(tmp_path / "o2.tif") as o:
         assert o.nodata == -9999.0
         assert (o.read(1)[:5] == -9999.0).all()  # NaN cells became the explicit sentinel
@@ -242,7 +245,7 @@ def test_all_nodata_inside_pilot_is_an_error(tmp_path):
     info, w = read_dem_info(dem), WarningCollector()
     d = prepare_spatial_domain(info, cfg_for(tmp_path, dem, g), w)
     with pytest.raises(InputError, match="nodata"):
-        extract_processing_dem(info, d, tmp_path / "o.tif", w)
+        reproject_dem(info, d, tmp_path / "o.tif", "bilinear", w)
 
 
 # ------------------------------ cell geometry --------------------------------- #

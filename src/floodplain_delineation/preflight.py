@@ -21,6 +21,9 @@ log = get_logger("preflight")
 #: being rewritten.
 DISK_BYTES_PER_CELL_KEPT = 22
 DISK_BYTES_PER_CELL_RAW = 8
+#: Extra bytes per cell when the REM is enabled: basin IDs 4 + IDW surface <=4 + REM <=4 (+ the int32 streams
+#: input of Subbasins, 4, which exists only while that tool runs).
+DISK_BYTES_PER_CELL_REM = 16
 
 
 def run_preflight(
@@ -29,7 +32,7 @@ def run_preflight(
     n_cells = int(width) * int(height)
     raster_f32 = n_cells * 4
     raster_f64 = n_cells * 8
-    kept = n_cells * DISK_BYTES_PER_CELL_KEPT
+    kept = n_cells * (DISK_BYTES_PER_CELL_KEPT + (DISK_BYTES_PER_CELL_REM if config.processing.rem.enabled else 0))
     raw = n_cells * DISK_BYTES_PER_CELL_RAW
     scratch = config.execution.scratch_directory
 

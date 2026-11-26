@@ -100,3 +100,51 @@ Trigger: a ~917 M-cell DEM failed in `D8Pointer` (`Error converting TAG(34737) t
 * Sampled WhiteboxTools memory can miss peaks between samples (every <= 5 s); tools shorter than that report "not sampled".
 
 Not implemented (deferred by decision): alternative conditioning tools/limits, TauDEM/MPI, basin tiling.
+
+## 7. Version 0.3.0 - REM per stream-link basin, global processing CRS, least-cost breach
+
+Based on `CIDI_REM_IDW_por_bacia.md` plus two extra instructions: exclusive (non-nested) basins per river reach, and
+`BreachDepressionsLeastCost` with configurable limits and a breach-then-fill option.
+
+**State found at the start.** The working tree already contained an untested draft (`rem.py`, `reprojection.py`, changes in
+`spatial.py`, `inputs.py`, `config.py`, `outputs.py`, `pipeline.py`, `preprocessing.py`, `rasters.py`) with no YAML, test or
+documentation updates; the existing test suite could not even be collected, the REM stages were registered but never executed, and
+the summary still used old stage names. The draft was reviewed and completed, not rewritten.
+
+**Decisions (please confirm)**
+* `Subbasins` instead of `Basins` (extra instruction overrides CIDI 5.1): `Basins` only delineates basins draining to the DEM edge.
+  Behaviour of `Subbasins` was verified, not assumed: one unit per stream link, exclusive, drainage cells carry the link's ID, IDs
+  positive but not contiguous, cells that reach no stream are NoData. It copies the NoData of the streams raster to its output
+  (255 for the pipeline's uint8 drainage raster, which would erase basin 255), so it is given an int32 copy with NoData -9999.
+* The CIDI contradicts itself on the reference DEM (sec. 2 step 2: initial DEM, "not the conditioned one"; REM-2: conditioned DEM
+  by default). The explicit method definition was followed: the REM samples and subtracts the **unconditioned** DEM on the processing
+  grid. HAND was not changed (sec. 12); the parenthetical "do not use the conditioned DEM for HAND" in sec. 2 contradicts sec. 12 and
+  is left as an open question.
+* "min and max configurable" was mapped to the real flags of `BreachDepressionsLeastCost`: `--dist` (maximum breach length, required,
+  no default), `--max_cost`, `--min_dist`, `--flat_increment`. If other parameters were meant, only `config.py`/`preprocessing.py` change.
+* "Breach then fill": two explicit steps (`BreachDepressionsLeastCost`, then `FillDepressionsWangAndLiu --fix_flats`), reported separately.
+  The tool's own `--fill` was not used: in WhiteboxTools 2.0.0 it panics (`Error unwrapping 'output'`, exit 101) whenever a depression
+  is left to fill (reproduced; unaffected by output name/dir, compression, verbosity). Not checked on 2.4.0.
+* Sampling is per (block, basin), an extension of "one per block": with link-level basins two links meet inside one block, and a plain
+  per-block rule would leave one of them without a sample. N = 1 keeps every valid drainage pixel.
+* IDW: exact, all basin samples, float64, chunked; no KD-tree (an exact all-sample IDW cannot use neighbour queries) and no new dependency.
+* Warp reproducibility: GDAL chooses the kernel width from the size of the destination window, so warped values depend slightly on the
+  stripe height (1e-4 m with one window up to centimetres with a few hundred rows; the `gdalwarp -wm` behaviour). `tolerance=0` and an
+  explicit source window were tried and did not remove it. The stripe height is therefore a fixed function of the grid width, independent
+  of the memory budget, and part of the stage fingerprint.
+
+**Changes.** `config.py` (processing CRS, resolution, resampling, REM, least-cost options), `spatial.py`/`inputs.py`/`reprojection.py`
+(stage 0), `rem.py` (basins, sampling, IDW, REM), `preprocessing.py` (conditioning steps), `pipeline.py` (REM stages after the HAND map,
+fingerprints, summary, limitations), `preflight.py`, YAMLs, README, `docs/methodology.md`, tests.
+
+**Measured here (synthetic data, 1 CPU, 3 GB RAM, WhiteboxTools 2.0.0 binary)**
+* 213 tests pass (131 before; 82 new).
+* 16 M-cell geographic DEM -> Albers grid (12.7 M valid cells): whole run 62 s; reprojection 2.1 s; 388 basins, 21 688 samples;
+  IDW 1.2e9 cell-sample evaluations in 21 s (5.6e7/s); Python peak 0.77 GiB.
+* `BreachDepressionsLeastCost` also raises a few cells (152 cells, at most 0.063 m on a synthetic DEM).
+
+**Not verified**
+* Nothing was run at the 917 M-cell scale or on real data; IDW cost there depends on cells x samples per basin and was not extrapolated.
+* WhiteboxTools 2.4.0 was not available: `Subbasins` semantics and the `--fill` panic were checked on the 2.0.0 binary only.
+* No scientific validation of HAND or REM. The REM stage ordering after the HAND map means a REM failure never costs the HAND product.
+

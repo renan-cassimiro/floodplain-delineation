@@ -122,10 +122,10 @@ def test_end_to_end_synthetic_workflow(valley_dataset, tmp_path):
     assert not (out / "intermediate" / ".wbt_tmp").exists()
 
     # all intermediates share the DEM-extent grid; resolution and CRS preserved (no resampling)
-    ext_arr, _, ext = _read(out / "intermediate" / "dem_processing_extent.tif")
+    ext_arr, _, ext = _read(out / "intermediate" / "dem_processing_crs.tif")
     with rasterio.open(dem) as src:
         assert ext.res == src.res and ext.crs == src.crs
-        assert np.array_equal(ext_arr, src.read(1, window=rasterio.windows.Window(*summary["spatial"]["processing_window"])))
+        assert np.array_equal(ext_arr, src.read(1, window=rasterio.windows.Window(*summary["spatial"]["source_window"])))
     for name in ["conditioned_dem", "flow_direction", "flow_accumulation", "drainage_network", "hand"]:
         _, _, s = _read(out / "intermediate" / f"{name}.tif")
         assert s.transform == ext.transform and s.shape == ext.shape and s.crs == ext.crs, name
@@ -246,7 +246,7 @@ def test_fill_method_runs_or_fails_loudly_never_silently_corrupts(tmp_path):
         assert "nodata" in str(exc).lower()
     else:  # tool handled the hole correctly: nodata must still be nodata in the final product
         out = tmp_path / "out" / "intermediate"
-        c, cn, _ = _read(out / "conditioned_dem.tif"); e, en, _ = _read(out / "dem_processing_extent.tif")
+        c, cn, _ = _read(out / "conditioned_dem.tif"); e, en, _ = _read(out / "dem_processing_crs.tif")
         assert np.array_equal(c == cn, e == en)
 
 

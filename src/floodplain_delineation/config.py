@@ -4,6 +4,9 @@ Design rules
 ------------
 * Scientific parameters (buffer, conditioning method, flow algorithm, drainage
   threshold, HAND threshold, vertical units) are REQUIRED. No silent defaults.
+  The processing CRS/resolution/resampling and the REM options have DOCUMENTED defaults
+  (ESRI:102033, native-derived resolution, bilinear, REM disabled); when the REM is
+  enabled, its sampling interval is required.
 * Non-scientific parameters (project name, subdirectory names, save flags,
   overwrite/verbose) have documented defaults.
 * Unknown keys are rejected so typos never pass silently.
@@ -21,13 +24,18 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 
 import yaml
 
-from .exceptions import ConfigError
+from .exceptions import ConfigError, InputError
+from .spatial import resolve_processing_crs
 
 VERTICAL_UNITS = ("meters", "centimeters", "decimeters", "feet", "us_survey_feet")
 BUFFER_UNITS = ("meters", "cells")
-CONDITIONING_METHODS = ("breach", "fill")
+CONDITIONING_METHODS = ("breach", "fill", "breach_least_cost")
 FLOW_ALGORITHMS = ("d8",)
 DRAINAGE_THRESHOLD_TYPES = ("cells", "area_km2")
+DEM_RESAMPLING_METHODS = ("near", "bilinear", "cubic", "cubic_spline", "lanczos")  # continuous data only
+
+DEFAULT_PROCESSING_CRS = "ESRI:102033"  # South America Albers Equal Area Conic (ESRI authority, not EPSG)
+DEFAULT_IDW_POWER = 2.0
 
 DEFAULT_PROJECT_NAME = "potential_floodplain_delineation"
 
@@ -41,6 +49,29 @@ class InputsConfig:
 
 
 @dataclass(frozen=True)
+class RemConfig:
+    """Relative Elevation Model: DEM minus an IDW surface of drainage elevations, per basin."""
+
+    enabled: bool = False
+    sampling_interval_pixels: Optional[int] = None   # required when enabled
+    idw_power: float = DEFAULT_IDW_POWER
+
+
+@dataclass(frozen=True)
+class BreachLeastCostConfig:
+    """Parameters of WhiteboxTools ``BreachDepressionsLeastCost`` (method ``breach_least_cost``).
+
+    ``max_distance_cells`` is the tool's ``--dist`` (maximum search distance of a breach path, in cells) and has
+    no default: it bounds how far a breach may reach and therefore how much the terrain can be modified.
+    """
+
+    max_distance_cells: int
+    max_cost: Optional[float] = None           # --max_cost (None: the tool's default, unbounded)
+    minimize_distance: bool = False            # --min_dist (flag): prefer shorter breach channels
+    flat_increment: Optional[float] = None     # --flat_increment (None: the tool's default)
+
+
+@dataclass(frozen=True)
 class ProcessingConfig:
     buffer_distance: float
     buffer_units: str
@@ -49,12 +80,12 @@ class ProcessingConfig:
     drainage_threshold_type: str
     drainage_threshold_value: float
     hand_threshold: float
-    crs: str = "ESRI:102033"
-    target_resolution: Optional[float] = None
+    crs: str = DEFAULT_PROCESSING_CRS                # processing CRS of the whole pipeline (projected)
+    target_resolution: Optional[float] = None        # CRS units; None: derived from the source DEM
     dem_resampling: str = "bilinear"
-    rem_enabled: bool = False
-    rem_sampling_interval_pixels: int = 10
-    rem_idw_power: float = 2.0
+    rem: RemConfig = field(default_factory=RemConfig)
+    breach_least_cost: Optional[BreachLeastCostConfig] = None   # required iff conditioning_method == breach_least_cost
+    fill_remaining: bool = False                                # breach_least_cost only: --fill (breach, then fill what is left)
 
 
 @dataclass(frozen=True)
@@ -67,6 +98,10 @@ class OutputsConfig:
     save_flow_accumulation: bool
     save_drainage_network: bool
     save_hand: bool
+    rem: str = "rem"                    # sub-directory of the REM products (rem.tif, surface)
+    save_basins: bool = True
+    save_rem_samples: bool = True
+    save_rem_drainage_surface: bool = True
 
 
 @dataclass(frozen=True)
@@ -106,15 +141,36 @@ class Config:
             "processing": {
                 "buffer_distance": p.buffer_distance,
                 "buffer_units": p.buffer_units,
-                "conditioning": {"method": p.conditioning_method},
+                "conditioning": {
+                    "method": p.conditioning_method,
+                    **(
+                        {
+                            "breach_least_cost": {
+                                "max_distance_cells": p.breach_least_cost.max_distance_cells,
+                                "max_cost": p.breach_least_cost.max_cost,
+                                "minimize_distance": p.breach_least_cost.minimize_distance,
+                                "flat_increment": p.breach_least_cost.flat_increment,
+                            },
+                            "fill_remaining": p.fill_remaining,
+                        }
+                        if p.breach_least_cost is not None
+                        else {}
+                    ),
+                },
                 "flow": {"algorithm": p.flow_algorithm},
                 "drainage": {
                     "threshold_type": p.drainage_threshold_type,
                     "threshold_value": p.drainage_threshold_value,
                 },
                 "hand": {"threshold": p.hand_threshold},
-                "crs": p.crs, "target_resolution": p.target_resolution, "dem_resampling": p.dem_resampling,
-                "rem": {"enabled": p.rem_enabled, "sampling_interval_pixels": p.rem_sampling_interval_pixels, "idw_power": p.rem_idw_power},
+                "crs": p.crs,
+                "target_resolution": p.target_resolution,
+                "dem_resampling": p.dem_resampling,
+                "rem": {
+                    "enabled": p.rem.enabled,
+                    "sampling_interval_pixels": p.rem.sampling_interval_pixels,
+                    "idw_power": p.rem.idw_power,
+                },
             },
             "outputs": {
                 "directory": str(o.directory),
@@ -125,6 +181,10 @@ class Config:
                 "save_flow_accumulation": o.save_flow_accumulation,
                 "save_drainage_network": o.save_drainage_network,
                 "save_hand": o.save_hand,
+                "rem": o.rem,
+                "save_basins": o.save_basins,
+                "save_rem_samples": o.save_rem_samples,
+                "save_rem_drainage_surface": o.save_rem_drainage_surface,
             },
             "execution": {
                 "overwrite": self.execution.overwrite,
@@ -253,21 +313,48 @@ def parse_config(data: Any, *, source_path: Optional[Path] = None, source_sha256
         ("buffer_distance", "conditioning", "flow", "drainage", "hand"),
         ("buffer_units", "crs", "target_resolution", "dem_resampling", "rem"),
     )
-    cond = _section(proc["conditioning"], "processing.conditioning", ("method",))
+    cond = _section(
+        proc["conditioning"], "processing.conditioning", ("method",), ("breach_least_cost", "fill_remaining")
+    )
+    cond_method = _choice(cond["method"], "processing.conditioning.method", CONDITIONING_METHODS)
+    breach_lc, fill_remaining = None, False
+    if cond_method == "breach_least_cost":
+        if "breach_least_cost" not in cond:
+            raise ConfigError(
+                "'processing.conditioning.breach_least_cost' is required when the method is 'breach_least_cost' "
+                "(at least 'max_distance_cells', the maximum breach path length in cells)."
+            )
+        bl = _section(
+            cond["breach_least_cost"], "processing.conditioning.breach_least_cost", ("max_distance_cells",),
+            ("max_cost", "minimize_distance", "flat_increment"),
+        )
+        dist = _number(bl["max_distance_cells"], "processing.conditioning.breach_least_cost.max_distance_cells",
+                       minimum=1.0, inclusive=True)
+        if isinstance(bl["max_distance_cells"], bool) or dist != int(dist):
+            raise ConfigError(
+                "'processing.conditioning.breach_least_cost.max_distance_cells' must be a positive whole number "
+                f"of cells, got {bl['max_distance_cells']!r}."
+            )
+        max_cost = bl.get("max_cost")
+        if max_cost is not None:
+            max_cost = float(_number(max_cost, "processing.conditioning.breach_least_cost.max_cost", minimum=0.0, inclusive=False))
+        flat_inc = bl.get("flat_increment")
+        if flat_inc is not None:
+            flat_inc = float(_number(flat_inc, "processing.conditioning.breach_least_cost.flat_increment", minimum=0.0, inclusive=False))
+        breach_lc = BreachLeastCostConfig(
+            max_distance_cells=int(dist), max_cost=max_cost,
+            minimize_distance=_boolean(bl.get("minimize_distance", False), "processing.conditioning.breach_least_cost.minimize_distance"),
+            flat_increment=flat_inc,
+        )
+        fill_remaining = _boolean(cond.get("fill_remaining", False), "processing.conditioning.fill_remaining")
+    elif "breach_least_cost" in cond or "fill_remaining" in cond:
+        raise ConfigError(
+            "'processing.conditioning.breach_least_cost' and 'processing.conditioning.fill_remaining' only apply "
+            f"to the method 'breach_least_cost' (configured method: '{cond_method}'); remove them or change the method."
+        )
     flow = _section(proc["flow"], "processing.flow", ("algorithm",))
     drain = _section(proc["drainage"], "processing.drainage", ("threshold_type", "threshold_value"))
     hand = _section(proc["hand"], "processing.hand", ("threshold",))
-    rem = _section(proc.get("rem", {}), "processing.rem", (), ("enabled", "sampling_interval_pixels", "idw_power"))
-    rem_enabled = _boolean(rem.get("enabled", False), "processing.rem.enabled")
-    rem_interval = _number(rem.get("sampling_interval_pixels", 10), "processing.rem.sampling_interval_pixels", minimum=1, inclusive=True)
-    if rem_interval != int(rem_interval):
-        raise ConfigError("processing.rem.sampling_interval_pixels must be a positive integer.")
-    rem_power = _number(rem.get("idw_power", 2.0), "processing.rem.idw_power", minimum=0.0, inclusive=False)
-    target_resolution = proc.get("target_resolution")
-    if target_resolution is not None:
-        target_resolution = _number(target_resolution, "processing.target_resolution", minimum=0.0, inclusive=False)
-    crs = _string(proc.get("crs", "ESRI:102033"), "processing.crs")
-    dem_resampling = _choice(proc.get("dem_resampling", "bilinear"), "processing.dem_resampling", ("nearest", "bilinear", "cubic"))
 
     threshold_type = _choice(drain["threshold_type"], "processing.drainage.threshold_type", DRAINAGE_THRESHOLD_TYPES)
     threshold_value = _number(drain["threshold_value"], "processing.drainage.threshold_value", minimum=0.0, inclusive=False)
@@ -277,16 +364,50 @@ def parse_config(data: Any, *, source_path: Optional[Path] = None, source_sha256
             f"threshold_type is 'cells', got {threshold_value:g}."
         )
 
+    crs_spec = _string(proc.get("crs", DEFAULT_PROCESSING_CRS), "processing.crs")
+    try:
+        resolve_processing_crs(crs_spec)  # fail early: must exist in the installed PROJ and be projected
+    except InputError as exc:
+        raise ConfigError(str(exc)) from exc
+    target_resolution = proc.get("target_resolution")
+    if target_resolution is not None:
+        target_resolution = _number(target_resolution, "processing.target_resolution", minimum=0.0, inclusive=False)
+    resampling = _choice(proc.get("dem_resampling", "bilinear"), "processing.dem_resampling", DEM_RESAMPLING_METHODS)
+
+    rem_raw = _section(proc.get("rem", {}), "processing.rem", (), ("enabled", "sampling_interval_pixels", "idw_power"))
+    rem_enabled = _boolean(rem_raw.get("enabled", False), "processing.rem.enabled")
+    interval = rem_raw.get("sampling_interval_pixels")
+    if interval is not None:
+        interval_f = _number(interval, "processing.rem.sampling_interval_pixels", minimum=1.0, inclusive=True)
+        if isinstance(interval, bool) or interval_f != int(interval_f):
+            raise ConfigError(
+                f"'processing.rem.sampling_interval_pixels' must be a positive whole number of pixels, got {interval!r}."
+            )
+        interval = int(interval_f)
+    elif rem_enabled:
+        raise ConfigError(
+            "'processing.rem.sampling_interval_pixels' is required when 'processing.rem.enabled' is true "
+            "(positive integer; smaller values give more drainage samples)."
+        )
+    idw_power = _number(rem_raw.get("idw_power", DEFAULT_IDW_POWER), "processing.rem.idw_power", minimum=0.0, inclusive=False)
+    if not math.isfinite(idw_power):
+        raise ConfigError("'processing.rem.idw_power' must be finite.")
+    rem = RemConfig(enabled=rem_enabled, sampling_interval_pixels=interval, idw_power=float(idw_power))
+
     processing = ProcessingConfig(
         buffer_distance=_number(proc["buffer_distance"], "processing.buffer_distance", minimum=0.0, inclusive=True),
         buffer_units=_choice(proc.get("buffer_units", "meters"), "processing.buffer_units", BUFFER_UNITS),
-        conditioning_method=_choice(cond["method"], "processing.conditioning.method", CONDITIONING_METHODS),
+        conditioning_method=cond_method,
         flow_algorithm=_choice(flow["algorithm"], "processing.flow.algorithm", FLOW_ALGORITHMS),
         drainage_threshold_type=threshold_type,
         drainage_threshold_value=threshold_value,
         hand_threshold=_number(hand["threshold"], "processing.hand.threshold", minimum=0.0, inclusive=True),
-        crs=crs, target_resolution=target_resolution, dem_resampling=dem_resampling,
-        rem_enabled=rem_enabled, rem_sampling_interval_pixels=int(rem_interval), rem_idw_power=rem_power,
+        crs=crs_spec,
+        target_resolution=target_resolution,
+        dem_resampling=resampling,
+        rem=rem,
+        breach_least_cost=breach_lc,
+        fill_remaining=fill_remaining,
     )
 
     out = _section(
@@ -301,12 +422,17 @@ def parse_config(data: Any, *, source_path: Optional[Path] = None, source_sha256
             "save_flow_accumulation",
             "save_drainage_network",
             "save_hand",
+            "rem",
+            "save_basins",
+            "save_rem_samples",
+            "save_rem_drainage_surface",
         ),
     )
     intermediates = _subdir(out.get("intermediates", "intermediate"), "outputs.intermediates")
     final = _subdir(out.get("final", "final"), "outputs.final")
-    if intermediates == final:
-        raise ConfigError("'outputs.intermediates' and 'outputs.final' must be different directories.")
+    rem_dir = _subdir(out.get("rem", "rem"), "outputs.rem")
+    if len({intermediates, final, rem_dir}) != 3:
+        raise ConfigError("'outputs.intermediates', 'outputs.final' and 'outputs.rem' must be different directories.")
     outputs = OutputsConfig(
         directory=_path(out["directory"], "outputs.directory"),
         intermediates=intermediates,
@@ -316,6 +442,10 @@ def parse_config(data: Any, *, source_path: Optional[Path] = None, source_sha256
         save_flow_accumulation=_boolean(out.get("save_flow_accumulation", True), "outputs.save_flow_accumulation"),
         save_drainage_network=_boolean(out.get("save_drainage_network", True), "outputs.save_drainage_network"),
         save_hand=_boolean(out.get("save_hand", True), "outputs.save_hand"),
+        rem=rem_dir,
+        save_basins=_boolean(out.get("save_basins", True), "outputs.save_basins"),
+        save_rem_samples=_boolean(out.get("save_rem_samples", True), "outputs.save_rem_samples"),
+        save_rem_drainage_surface=_boolean(out.get("save_rem_drainage_surface", True), "outputs.save_rem_drainage_surface"),
     )
 
     ex = _section(

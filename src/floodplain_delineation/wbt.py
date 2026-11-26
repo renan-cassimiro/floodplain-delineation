@@ -104,9 +104,7 @@ class WhiteboxRunner:
         try:
             return subprocess.run(
                 [str(self.executable), *args],
-                # Version/help metadata calls are tiny; do not let an aggressively short
-                # processing timeout (e.g. 0.5 s) make process startup fail before the tool runs.
-                capture_output=True, text=True, timeout=max(self.timeout or 0.0, 5.0), check=False,
+                capture_output=True, text=True, timeout=self.timeout, check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise WhiteboxError(f"Could not execute WhiteboxTools ({self.executable}): {exc}") from exc

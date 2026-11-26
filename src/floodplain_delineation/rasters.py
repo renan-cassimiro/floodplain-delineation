@@ -208,6 +208,7 @@ def create_raster(
     tiled: bool = False,
     tags: Optional[Dict[str, Any]] = None,
     description: Optional[str] = None,
+    creation_options: Optional[Dict[str, Any]] = None,
 ) -> Iterator[Any]:
     """Open a single-band GeoTIFF for block-wise writing; the partial file is removed on failure.
 
@@ -221,6 +222,8 @@ def create_raster(
         profile["compress"] = compress
     if tiled:
         profile.update(tiled=True, blockxsize=512, blockysize=512)
+    if creation_options:
+        profile.update(creation_options)
     try:
         with rasterio.open(path, "w", **profile) as dst:
             if tags:

@@ -4,33 +4,42 @@ project:
   name: "potential_floodplain_delineation"
 
 inputs:
-  dem: "data/input/xingu_river/xingu_river_fathomdem_30m_cog.tif"                 # single-band elevation raster with CRS and nodata
+  dem: "data/input/xingu_river/xingu_river_fathomdem_30m_reprojetado.tif"                 # single-band elevation raster with CRS and nodata
   pilot_area: "data/input/xingu_river/xingu_river_study_area_bounding_box.gpkg" # polygon layer(s); multiple polygons are dissolved
   pilot_layer: null                   # optional GPKG layer name
   vertical_units: "meters"            # vertical unit of the DEM (documentation + HAND threshold unit)
 
 processing:
-  buffer_distance: 0               # context buffer around the pilot area
+  # All hydrological processing and the REM run on ONE grid in a projected CRS. The input DEM is reprojected
+  # once (stage 0) -- unless it already is in this CRS at the requested resolution, then it is only cropped.
+  crs: "EPSG:31982"                  # South America Albers Equal Area Conic (ESRI authority, NOT an EPSG code); default
+  target_resolution: 30             # CRS units (metres); null: derived from the source DEM by GDAL and recorded in the summary
+  dem_resampling: "bilinear"          # near | bilinear | cubic | cubic_spline | lanczos (continuous elevation only)
+  buffer_distance: 10                  # context buffer around the pilot area, in the processing CRS
   buffer_units: "meters"              # "meters" or "cells"
   conditioning:
-    method: "breach"                  # "breach" (BreachDepressions) or "fill" (FillDepressionsWangAndLiu)
+    method: "breach_least_cost"       # "breach" | "fill" | "breach_least_cost" (BreachDepressionsLeastCost)
+    breach_least_cost:                # required for breach_least_cost; illustrative values -- NOT calibrated
+      max_distance_cells: 100         # --dist: maximum length of a breach path, in cells (required, no default)
+      max_cost: null                  # --max_cost: maximum breach cost; null = tool default (unbounded)
+      minimize_distance: true         # --min_dist: prefer shorter breach channels
+      flat_increment: null            # --flat_increment: null = tool default
+    fill_remaining: false             # true: after the breach, fill the depressions that are left
+                                      # (second step: FillDepressionsWangAndLiu --fix_flats)
   flow:
     algorithm: "d8"                   # only D8 is supported
   drainage:
     threshold_type: "area_km2"        # "cells" or "area_km2"
-    threshold_value: 1000         # minimum contributing cells or km2 to define drainage
-  crs: "ESRI:102033"
-  target_resolution: null
-  dem_resampling: "bilinear"
-  rem:
-    enabled: true
-    sampling_interval_pixels: 20
-    idw_power: 2.0
+    threshold_value: 5000            # minimum contributing cells or km2 to define drainage
   hand:
-    threshold: 15                      # same vertical unit as the DEM
+    threshold: 1600                 # same vertical unit as the DEM
+  rem:                                # Relative Elevation Model: DEM minus an IDW surface per stream-link basin
+    enabled: true                     # false: HAND only (WhiteboxTools Subbasins is then never run)
+    sampling_interval_pixels: 10      # one drainage sample per 10x10-pixel block and basin (1 = every drainage pixel)
+    idw_power: 2.0                    # IDW exponent; all samples of a basin take part, no search radius
 
 outputs:
-  directory: "outputs/xingu_river"
+  directory: "outputs"
   intermediates: "intermediate"
   final: "final"
   save_conditioned_dem: true
@@ -38,10 +47,14 @@ outputs:
   save_flow_accumulation: true
   save_drainage_network: true
   save_hand: true
+  rem: "rem"                        # sub-directory of the REM products
+  save_basins: true                 # basins.tif (stream-link basin IDs)
+  save_rem_samples: true            # rem_samples.npz (sampled drainage pixels)
+  save_rem_drainage_surface: true   # rem/rem_drainage_surface.tif (IDW surface)
 
 execution:
-  overwrite: false                  # true: start from scratch (excludes resume)
-  resume: true                     # true: reuse up-to-date stages of a previous run (after a failure, or to change only the HAND/drainage threshold)
+  overwrite: true                  # true: start from scratch (excludes resume)
+  resume: false                     # true: reuse up-to-date stages of a previous run (after a failure, or to change only the HAND/drainage threshold)
   verbose: true
   # max_procs: 18                   # passed to WhiteboxTools (--max_procs); most of its tools are single-threaded
   # heartbeat_seconds: 300          # progress message interval during long WhiteboxTools runs

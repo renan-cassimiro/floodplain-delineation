@@ -28,12 +28,13 @@ REQUIRED_NAMES = {
     "flow_accumulation": "flow_accumulation.tif",
     "drainage_network": "drainage_network.tif",
     "hand": "hand.tif",
-    "basins": "basins.tif",
-    "rem_surface": "rem_drainage_surface.tif",
-    "rem": "rem.tif",
 }
 FINAL_NAME = "potential_floodplain.tif"
-EXTENT_NAME = "dem_processing_extent.tif"
+DEM_NAME = "dem_processing_crs.tif"          # DEM on the master processing grid (Stage 0)
+BASINS_NAME = "basins.tif"
+REM_SAMPLES_NAME = "rem_samples.npz"
+REM_SURFACE_NAME = "rem_drainage_surface.tif"
+REM_NAME = "rem.tif"
 MANIFEST_FILE = "stage_manifest.json"
 
 #: Files that are always regenerated, also when resuming a previous run.
@@ -48,6 +49,7 @@ class OutputPlan:
     work_dir: Path
     paths: Dict[str, Path]
     save_flags: Dict[str, bool]
+    rem_dir: Optional[Path] = None   # None when the REM is disabled
 
     @property
     def all_files(self) -> List[Path]:
@@ -58,8 +60,13 @@ def plan_outputs(config: Config) -> OutputPlan:
     o = config.outputs
     inter = o.directory / o.intermediates
     final = o.directory / o.final
-    paths = {"dem_processing_extent": inter / EXTENT_NAME, "dem_reprojected": inter / "dem_processing_crs.tif"}
+    rem_dir = o.directory / o.rem
+    paths = {"dem_processing_crs": inter / DEM_NAME}
     paths.update({k: inter / v for k, v in REQUIRED_NAMES.items()})
+    paths["basins"] = inter / BASINS_NAME
+    paths["rem_samples"] = inter / REM_SAMPLES_NAME
+    paths["rem_drainage_surface"] = rem_dir / REM_SURFACE_NAME
+    paths["rem"] = rem_dir / REM_NAME
     paths["potential_floodplain"] = final / FINAL_NAME
     paths["processing_summary"] = o.directory / "processing_summary.json"
     paths["processing_log"] = o.directory / "processing.log"
@@ -71,9 +78,9 @@ def plan_outputs(config: Config) -> OutputPlan:
         "flow_accumulation": o.save_flow_accumulation,
         "drainage_network": o.save_drainage_network,
         "hand": o.save_hand,
-        "basins": config.processing.rem_enabled,
-        "rem_surface": config.processing.rem_enabled,
-        "rem": config.processing.rem_enabled,
+        "basins": o.save_basins,
+        "rem_samples": o.save_rem_samples,
+        "rem_drainage_surface": o.save_rem_drainage_surface,
     }
     scratch = config.execution.scratch_directory
     if scratch is not None:  # one sub-directory per output directory, so parallel runs never collide
@@ -81,7 +88,7 @@ def plan_outputs(config: Config) -> OutputPlan:
         work_dir = scratch / f"{config.project_name}_{tag}"
     else:
         work_dir = inter / ".wbt_tmp"
-    return OutputPlan(o.directory, inter, final, work_dir, paths, flags)
+    return OutputPlan(o.directory, inter, final, work_dir, paths, flags, rem_dir if config.processing.rem.enabled else None)
 
 
 def prepare_output_dirs(plan: OutputPlan, config: Config) -> None:
@@ -112,8 +119,9 @@ def prepare_output_dirs(plan: OutputPlan, config: Config) -> None:
             "outputs.directory."
         )
     try:
-        for d in (plan.intermediate_dir, plan.final_dir):
-            d.mkdir(parents=True, exist_ok=True)
+        for d in (plan.intermediate_dir, plan.final_dir, plan.rem_dir):
+            if d is not None:
+                d.mkdir(parents=True, exist_ok=True)
         probe = plan.root / ".write_test"
         probe.write_text("ok")
         probe.unlink()
@@ -130,6 +138,8 @@ def prepare_output_dirs(plan: OutputPlan, config: Config) -> None:
         plan.work_dir.mkdir(parents=True, exist_ok=True)
         stale = list(plan.work_dir.glob("*")) + list(plan.intermediate_dir.glob("*.partial"))
         stale += list(plan.final_dir.glob("*.partial"))
+        if plan.rem_dir is not None:
+            stale += list(plan.rem_dir.glob("*.partial"))
         for f in stale:
             if f.is_file():
                 f.unlink()
@@ -179,8 +189,8 @@ def collect_versions(wbt_version: Optional[str]) -> Dict[str, str]:
     }
 
 
-def write_processing_area(path: Path, domain, dem_crs) -> None:
-    """GeoPackage with the pilot area (clipped to the DEM), the full pilot area and the processing extent."""
+def write_processing_area(path: Path, domain, crs) -> None:
+    """GeoPackage (processing CRS) with the pilot area (clipped to the DEM), the full pilot area and the processing extent."""
     layers = {
         "pilot_area_in_dem": domain.pilot,
         "pilot_area_full": domain.pilot_full,
@@ -188,7 +198,7 @@ def write_processing_area(path: Path, domain, dem_crs) -> None:
         "requested_extent": box(*domain.requested_bounds),
     }
     for i, (name, geom) in enumerate(layers.items()):
-        gpd.GeoDataFrame({"name": [name]}, geometry=[geom], crs=dem_crs.to_wkt()).to_file(
+        gpd.GeoDataFrame({"name": [name]}, geometry=[geom], crs=crs.to_wkt()).to_file(
             path, layer=name, driver="GPKG", mode="w" if i == 0 else "a"
         )
 

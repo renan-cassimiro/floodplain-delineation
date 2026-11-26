@@ -14,7 +14,7 @@ from floodplain_delineation.pipeline import run_pipeline
 
 pytestmark = [requires_wbt, pytest.mark.wbt]
 
-ALL_STAGES = ["dem_extraction", "conditioning", "flow_direction", "flow_accumulation", "drainage", "hand"]
+ALL_STAGES = ["dem_reprojection", "conditioning", "flow_direction", "flow_accumulation", "drainage", "hand"]
 
 
 def cfg_of(tmp_path, dem, gpkg, **over):
@@ -41,7 +41,7 @@ def test_identical_rerun_reuses_everything_and_reproduces_the_result(valley_data
     assert s2["status"] == "success" and s2["stages_reused_from_previous_run"] == ALL_STAGES
     assert tools_run(s2) == []                                         # no WhiteboxTools call at all
     assert (out / "final" / "potential_floodplain.tif").read_bytes() == before
-    for key in ("dem_extraction", "conditioning", "drainage", "hand", "flow_routing"):
+    for key in ("dem_reprojection", "conditioning", "drainage", "hand", "flow_routing"):
         assert s2["stages"][key] == s1["stages"][key], key             # summary stays complete
     assert "Resume mode" in (out / "processing.log").read_text()
     assert (out / "processing.log").read_text().count("=== potential_floodplain_delineation ===") == 2   # log appended
@@ -63,7 +63,7 @@ def test_changing_the_drainage_threshold_reruns_drainage_and_hand_only(valley_da
     run_pipeline(cfg_of(tmp_path, dem, gpkg))
     s2 = run_pipeline(cfg_of(tmp_path, dem, gpkg, **{"execution.resume": True, "processing.drainage.threshold_value": 400}))
     assert tools_run(s2) == ["ExtractStreams", "ElevationAboveStream"]
-    assert s2["stages_reused_from_previous_run"] == ["dem_extraction", "conditioning", "flow_direction", "flow_accumulation"]
+    assert s2["stages_reused_from_previous_run"] == ["dem_reprojection", "conditioning", "flow_direction", "flow_accumulation"]
     assert s2["stages"]["drainage"]["threshold"]["effective_cells"] == 400
 
 
@@ -71,7 +71,7 @@ def test_changing_the_conditioning_method_reruns_everything_downstream(valley_da
     dem, gpkg, _ = valley_dataset
     run_pipeline(cfg_of(tmp_path, dem, gpkg))
     s2 = run_pipeline(cfg_of(tmp_path, dem, gpkg, **{"execution.resume": True, "processing.conditioning.method": "fill"}))
-    assert s2["stages_reused_from_previous_run"] == ["dem_extraction"]
+    assert s2["stages_reused_from_previous_run"] == ["dem_reprojection"]
     assert tools_run(s2)[0] == "FillDepressionsWangAndLiu" and len(tools_run(s2)) == 5
 
 
@@ -118,15 +118,15 @@ def test_failure_then_resume_continues_from_the_failed_stage(valley_dataset, tmp
         run_pipeline(cfg_of(tmp_path, dem, gpkg))
     out = tmp_path / "out"
     failed = json.loads((out / "processing_summary.json").read_text())
-    assert failed["status"] == "failed" and set(failed["stages"]) >= {"dem_extraction", "conditioning", "flow_routing"}
+    assert failed["status"] == "failed" and set(failed["stages"]) >= {"dem_reprojection", "conditioning", "flow_routing"}
     assert "execution.resume: true" in (out / "processing.log").read_text()
     manifest = json.loads((out / "stage_manifest.json").read_text())["stages"]
-    assert set(manifest) == {"dem_extraction", "conditioning", "flow_direction"}
+    assert set(manifest) == {"dem_reprojection", "conditioning", "flow_direction"}
 
     monkeypatch.setattr(pl, "compute_flow_accumulation", real)
     s2 = run_pipeline(cfg_of(tmp_path, dem, gpkg, **{"execution.resume": True}))
     assert s2["status"] == "success"
-    assert s2["stages_reused_from_previous_run"] == ["dem_extraction", "conditioning", "flow_direction"]
+    assert s2["stages_reused_from_previous_run"] == ["dem_reprojection", "conditioning", "flow_direction"]
     assert tools_run(s2) == ["D8FlowAccumulation", "ExtractStreams", "ElevationAboveStream"]
 
 
@@ -160,7 +160,7 @@ def test_whole_pipeline_gives_identical_results_with_tiny_blocks(valley_dataset,
     a = run_pipeline(cfg_of(tmp_path / "a", dem, gpkg))
     monkeypatch.setattr(rasters, "BLOCK_BYTES", 1500)           # many stripes everywhere
     b = run_pipeline(cfg_of(tmp_path / "b", dem, gpkg))
-    for key in ("dem_extraction", "conditioning", "drainage", "floodplain"):
+    for key in ("dem_reprojection", "conditioning", "drainage", "floodplain"):
         sa, sb = dict(a["stages"][key]), dict(b["stages"][key])
         for d in (sa, sb):
             d.pop("path", None)

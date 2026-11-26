@@ -1,34 +1,67 @@
-"""Stage 2: DEM extraction over the processing extent and hydrological conditioning.
+"""Stage 2: hydrological conditioning of the processing DEM.
 
-Both steps work on full-width row stripes (see :mod:`rasters`), never on whole-raster arrays.
+The comparison with the unconditioned DEM works on full-width row stripes (see :mod:`rasters`),
+never on whole-raster arrays. (Stage 0, :mod:`reprojection`, produces the processing DEM.)
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import rasterio
-from rasterio.features import geometry_mask
-from rasterio.windows import Window
 
-from .exceptions import InputError, ProcessingError
-from .inputs import DemInfo, SpatialDomain
+from .config import ProcessingConfig
+from .exceptions import ProcessingError
 from .logging_utils import WarningCollector, get_logger
-from .rasters import ensure_same_grid, grid_of, row_stripes, shift_rows, valid_mask
+from .rasters import ensure_same_grid, grid_of, row_stripes, valid_mask
 from .wbt import WhiteboxRunner
 
 log = get_logger("preprocessing")
 
-#: configuration method -> (WhiteboxTools tool name, extra flags)
+#: methods with fixed flags: configuration method -> (WhiteboxTools tool name, extra flags)
 CONDITIONING_TOOLS = {
     "breach": ("BreachDepressions", []),
     "fill": ("FillDepressionsWangAndLiu", ["--fix_flats"]),
 }
+BREACH_LEAST_COST_TOOL = "BreachDepressionsLeastCost"
 
-#: Replacement nodata when the source DEM uses NaN (WhiteboxTools needs a finite sentinel).
-NAN_NODATA_SENTINEL = -9999.0
+
+FILL_AFTER_BREACH_TOOL = "FillDepressionsWangAndLiu"
+FILL_AFTER_BREACH_FLAGS = ["--fix_flats"]
+
+
+def conditioning_plan(processing: ProcessingConfig) -> List[Tuple[str, List[str]]]:
+    """Ordered WhiteboxTools steps ``[(tool, flags), ...]`` for the configured conditioning method.
+
+    ``breach_least_cost`` maps the configuration one-to-one onto the flags of ``BreachDepressionsLeastCost``
+    (checked against the installed tool's help by the runner): ``--dist`` (maximum breach path length, cells),
+    ``--max_cost``, ``--min_dist`` (flag) and ``--flat_increment``. Nothing is passed that was not configured.
+
+    ``fill_remaining`` adds a second step, ``FillDepressionsWangAndLiu --fix_flats`` on the breached DEM (breach
+    first, then fill what is left). The tool's own ``--fill`` flag is deliberately not used: in WhiteboxTools 2.0.0
+    it panics ("Error unwrapping 'output'") whenever a depression is left to fill (reproduced), whereas two explicit
+    steps behave the same on every version and let each step be validated and reported separately.
+    """
+    method = processing.conditioning_method
+    if method != "breach_least_cost":
+        tool, flags = CONDITIONING_TOOLS[method]
+        return [(tool, list(flags))]
+    bl = processing.breach_least_cost
+    if bl is None:  # pragma: no cover - rejected by the configuration parser
+        raise ProcessingError("breach_least_cost conditioning needs 'processing.conditioning.breach_least_cost'.")
+    flags = [f"--dist={bl.max_distance_cells}"]
+    if bl.max_cost is not None:
+        flags.append(f"--max_cost={bl.max_cost!r}")
+    if bl.minimize_distance:
+        flags.append("--min_dist")
+    if bl.flat_increment is not None:
+        flags.append(f"--flat_increment={bl.flat_increment!r}")
+    steps = [(BREACH_LEAST_COST_TOOL, flags)]
+    if processing.fill_remaining:
+        steps.append((FILL_AFTER_BREACH_TOOL, list(FILL_AFTER_BREACH_FLAGS)))
+    return steps
 
 #: Elevation changes below this magnitude (DEM vertical units) are not counted as modifications.
 CHANGE_TOLERANCE = 1e-9
@@ -36,83 +69,6 @@ CHANGE_TOLERANCE = 1e-9
 DECREASE_THRESHOLDS = (1.0, 5.0, 10.0, 25.0, 50.0)
 #: Log-spaced bins for the approximate distribution of elevation decreases (20 bins per decade).
 _DECREASE_EDGES = np.logspace(-3, 4, 141)
-
-
-def extract_processing_dem(
-    dem: DemInfo, domain: SpatialDomain, out_path: Path, warnings: WarningCollector
-) -> Dict[str, Any]:
-    """Write the unconditioned DEM over the processing window (processing CRS master grid).
-
-    Valid values are copied unchanged. Integer DEMs are stored as float32 (lossless for
-    elevation ranges); a NaN nodata is replaced by an explicit finite sentinel.
-    """
-    win = domain.window
-    height, width = int(win.height), int(win.width)
-    with rasterio.open(dem.path) as src:
-        src_dtype = np.dtype(src.dtypes[0])
-        floating = np.issubdtype(src_dtype, np.floating)
-        out_dtype = src_dtype if floating else np.dtype(np.float32)
-        if not floating:
-            log.info("Integer DEM stored as float32 in the intermediate product (values unchanged).")
-        out_nodata = dem.nodata
-        if not np.isfinite(out_nodata):
-            out_nodata = NAN_NODATA_SENTINEL
-            warnings.add(f"DEM nodata is NaN/inf; intermediate rasters use {NAN_NODATA_SENTINEL} as nodata.")
-        src_nodata = dem.nodata if np.isfinite(dem.nodata) else None
-
-        profile: Dict[str, Any] = dict(
-            driver="GTiff", height=height, width=width, count=1, dtype=out_dtype.name,
-            crs=dem.crs, transform=domain.window_transform, nodata=out_nodata,
-            BIGTIFF="IF_SAFER",  # uncompressed: read directly by WhiteboxTools
-        )
-        n_valid = n_nodata = n_inside = n_pilot_valid = 0
-        pilot_miny, pilot_maxy = domain.pilot.bounds[1], domain.pilot.bounds[3]
-        try:
-            with rasterio.open(out_path, "w", **profile) as dst:
-                for stripe in row_stripes(height, width, src_dtype.itemsize + out_dtype.itemsize + 2):
-                    r0, rows = int(stripe.row_off), int(stripe.height)
-                    read_win = Window(win.col_off, win.row_off + r0, width, rows)
-                    arr = src.read(1, window=read_win)
-                    valid = valid_mask(arr, src_nodata)
-                    arr = np.where(valid, arr.astype(out_dtype, copy=False), out_dtype.type(out_nodata))
-                    dst.write(arr, 1, window=stripe)
-                    n_valid += int(valid.sum())
-                    n_nodata += int(valid.size - valid.sum())
-
-                    t = shift_rows(domain.window_transform, r0)
-                    top, bottom = t.f, t.f + t.e * rows
-                    if bottom <= pilot_maxy and top >= pilot_miny:  # stripe overlaps the pilot's y-range
-                        inside = ~geometry_mask([domain.pilot], out_shape=arr.shape, transform=t, all_touched=False)
-                        n_inside += int(inside.sum())
-                        n_pilot_valid += int((inside & valid).sum())
-                dst.update_tags(
-                    PRODUCT="unconditioned DEM over processing extent", SOURCE=str(dem.path)
-                )
-            if n_valid == 0:
-                raise InputError("The processing extent contains no valid (non-nodata) DEM cells.")
-            # Pilot-area coverage of valid cells (fail early when the pilot only covers nodata).
-            if n_inside == 0:
-                raise InputError("The pilot area is smaller than one DEM cell; no cell centre falls inside it.")
-            if n_pilot_valid == 0:
-                raise InputError("All DEM cells inside the pilot area are nodata.")
-        except Exception:
-            out_path.unlink(missing_ok=True)
-            raise
-    if n_pilot_valid < n_inside:
-        warnings.add(
-            f"{n_inside - n_pilot_valid} of {n_inside} cells inside the pilot area "
-            "are DEM nodata; they stay nodata in the final map."
-        )
-    return {
-        "path": str(out_path),
-        "shape": [height, width],
-        "valid_cells": n_valid,
-        "nodata_cells": n_nodata,
-        "nodata_value": out_nodata,
-        "dtype": out_dtype.name,
-        "pilot_cells": n_inside,
-        "pilot_valid_cells": n_pilot_valid,
-    }
 
 
 def _approx_quantile(counts: np.ndarray, edges: np.ndarray, q: float) -> float:
@@ -194,20 +150,7 @@ def compare_conditioned(
     }
 
 
-def condition_dem(
-    runner: WhiteboxRunner,
-    method: str,
-    dem_path: Path,
-    out_path: Path,
-    work_dir: Path,
-    warnings: WarningCollector,
-) -> Dict[str, Any]:
-    """Run hydrological conditioning and validate the result (block by block)."""
-    tool, extra = CONDITIONING_TOOLS[method]
-    log.info("Conditioning DEM with WhiteboxTools %s (method='%s').", tool, method)
-    runner.run_raster(tool, [f"--dem={dem_path}", *extra], work_dir=work_dir, output=out_path)
-    ensure_same_grid(grid_of(dem_path), out_path, "Conditioned DEM", warnings)
-    diag = compare_conditioned(dem_path, out_path, tool, extra)
+def _log_diag(diag: Dict[str, Any]) -> None:
     log.info(
         "Conditioning modified %d cells (%.3f%%); max decrease %.3f, max increase %.3f (DEM vertical units).",
         diag["cells_modified"], 100 * diag["fraction_modified"],
@@ -219,4 +162,55 @@ def condition_dem(
         diag["cells_lowered"], pct["p50"], pct["p95"], pct["p99"],
         ", ".join(f"{k}: {v}" for k, v in diag["cells_lowered_more_than"].items()),
     )
+
+
+def condition_dem(
+    runner: WhiteboxRunner,
+    method: str,
+    steps: List[Tuple[str, List[str]]],
+    dem_path: Path,
+    out_path: Path,
+    work_dir: Path,
+    warnings: WarningCollector,
+) -> Dict[str, Any]:
+    """Run the conditioning steps in order and validate the result block by block.
+
+    A single step writes ``out_path``. With a second step (breach, then fill) the first one writes an
+    intermediate raster in ``work_dir``; its effect and the effect of the fill are reported separately and the
+    intermediate raster is removed. The reported modification statistics always compare the final conditioned DEM
+    with the original one.
+    """
+    grid = grid_of(dem_path)
+    current = dem_path
+    step_reports: List[Dict[str, Any]] = []
+    temporaries: List[Path] = []
+    try:
+        for i, (tool, flags) in enumerate(steps):
+            last = i == len(steps) - 1
+            target = out_path if last else work_dir / f"conditioning_step{i + 1}.tif"
+            log.info("Conditioning step %d/%d with WhiteboxTools %s (method='%s', flags: %s).",
+                     i + 1, len(steps), tool, method, " ".join(flags) or "none")
+            runner.run_raster(tool, [f"--dem={current}", *flags], work_dir=work_dir, output=target)
+            if not last:
+                temporaries.append(target)
+            ensure_same_grid(grid, target, f"Conditioned DEM (step {i + 1})", warnings)
+            if len(steps) > 1:
+                step_diag = compare_conditioned(current, target, tool, flags)
+                step_reports.append({
+                    "step": i + 1, "tool": tool, "flags": flags,
+                    "cells_modified": step_diag["cells_modified"],
+                    "max_elevation_decrease": step_diag["max_elevation_decrease"],
+                    "max_elevation_increase": step_diag["max_elevation_increase"],
+                })
+                log.info("  step %d (%s): %d cells modified, max decrease %.3f, max increase %.3f.", i + 1, tool,
+                         step_diag["cells_modified"], step_diag["max_elevation_decrease"], step_diag["max_elevation_increase"])
+            current = target
+        diag = compare_conditioned(dem_path, out_path, steps[-1][0], steps[-1][1])
+    finally:
+        for t in temporaries:
+            t.unlink(missing_ok=True)
+    diag["tools"] = [t for t, _ in steps]
+    diag["tool"] = " + ".join(diag["tools"])
+    diag["steps"] = step_reports or [{"step": 1, "tool": steps[0][0], "flags": steps[0][1]}]
+    _log_diag(diag)
     return diag

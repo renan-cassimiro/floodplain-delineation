@@ -2,43 +2,39 @@
 
 ## Scope
 
-This version implements only a reproducible DEM-derived potential floodplain workflow. It does not compare the result with external floodplain products and does not perform scientific validation, classification, machine learning, hydraulic modelling, ecological evaluation, or observational inundation mapping.
+This version implements a reproducible, DEM-derived workflow with two products: a **potential floodplain** mask (HAND) and,
+optionally, a **Relative Elevation Model** (REM). It does not compare results with external floodplain products and does not
+perform scientific validation, classification, machine learning, hydraulic modelling, ecological evaluation or observational
+inundation mapping.
 
 ## Processing logic
 
-1. Validate and reproject the full source DEM to the configured projected processing CRS and master grid.
-2. Read, validate and reproject the pilot-area geometry to the processing CRS.
-3. Derive the buffered processing window on the reprojected DEM grid.
-4. Condition the DEM with the configured WhiteboxTools method.
-5. Calculate D8 flow direction and D8 flow accumulation.
-6. Extract drainage cells using the configured flow-accumulation threshold.
-7. Calculate HAND with WhiteboxTools `ElevationAboveStream`.
-8. Optionally, delineate basin IDs with WhiteboxTools `Basins` from the existing D8 pointer, sample drainage elevations and calculate basin-wise IDW REM.
-9. Classify cells with HAND less than or equal to the configured threshold as potential floodplain.
-10. Mask the final binary raster to the pilot-area geometry.
+0. **Processing grid and DEM reprojection.** The processing CRS is projected (default `ESRI:102033`, South America Albers Equal
+   Area Conic; ESRI authority, never an EPSG code). The extent (pilot area + buffer, intersected with the DEM footprint
+   transformed with densified edges) defines a grid whose resolution is configured or derived by GDAL and whose origin is
+   snapped to a multiple of the resolution. The DEM is warped onto it in fixed-height stripes. A cell is valid only if the
+   nearest source cell is valid (nodata is never interpolated across). A DEM already in the processing CRS with no requested
+   resolution is only cropped.
+1. **Conditioning** (on the unconditioned DEM of stage 0): `breach`, `fill`, or `breach_least_cost`
+   (`BreachDepressionsLeastCost` with configurable maximum path length, maximum cost, distance minimisation and flat increment),
+   optionally followed by `FillDepressionsWangAndLiu --fix_flats` for the depressions the bounded breach could not cross.
+2. **D8 flow direction and accumulation** (WhiteboxTools).
+3. **Drainage network**: cells with accumulation >= the configured threshold (cells or km2 of the processing CRS).
+4. **HAND**: elevation above the nearest downslope drainage cell along the D8 path (conditioned DEM).
+5. **Potential floodplain**: valid cells with HAND <= the configured threshold, clipped to the pilot area.
+6. **REM** (optional, independent of HAND):
+   1. *Basins*: WhiteboxTools `Subbasins` gives the exclusive, non-nested catchment of each stream link.
+   2. *Sampling*: per N x N block and basin, the drainage pixel closest to the block centre; elevation from the
+      unconditioned DEM of stage 0.
+   3. *Interpolation*: IDW with all samples of the cell's own basin, euclidean distances in the processing CRS, exponent `p`.
+   4. *REM*: DEM minus the surface; negative values are kept.
 
 ## Interpretation
 
-The resulting map represents a topographically defined **potential floodplain**, not observed inundation extent.
+The HAND mask is a topographically defined **potential floodplain**, not observed inundation extent. The REM is a relative
+elevation product above a surface interpolated from sampled drainage elevations; it is not a water surface and is not validated.
 
-The result is sensitive to DEM quality and resolution, hydrological conditioning, the derived drainage-network scale, the HAND threshold, the processing CRS, and the raster grid produced during reprojection.
-
-## Processing CRS and basin-wise REM
-
-The input DEM is first reprojected to the configured processing CRS (default `ESRI:102033`,
-South America Albers Equal Area Conic). The DEM is then processed on a single master grid;
-conditioning, D8 routing, accumulation, drainage extraction, HAND, basin delineation and REM
-all use that grid. The output resolution can be configured; if omitted, GDAL's suggested
-resolution is used. Reprojection and resampling may change elevation values and therefore
-change downstream hydrological results compared with processing in the source CRS.
-
-The optional REM uses WhiteboxTools `Basins` on the existing D8 pointer raster. Elevation
-samples are taken from drainage cells in the conditioned DEM using a user-configured systematic
-pixel interval. For each basin independently, all its samples contribute to Euclidean IDW:
-
-`Z_IDW(x) = sum(z_i / d_i^p) / sum(1 / d_i^p)`
-
-The REM is `conditioned_DEM - Z_IDW`. No samples from another basin contribute to a cell's
-estimate. The resulting reference surface is topographic, because sample elevations originate
-from the conditioned DEM; it is not a measured water surface or hydraulic simulation. Exact
-all-sample IDW is computationally expensive for large basins and dense sampling.
+Both are sensitive to DEM quality and resolution, the resampling to the processing grid, the conditioning, the drainage
+threshold, the processing CRS and, for the REM, the basin units, the sampling interval and the IDW exponent. HAND and the REM
+use different reference elevations (conditioned vs unconditioned DEM) and different association rules (D8 path vs per-basin IDW
+surface), so they are not expected to agree cell by cell.

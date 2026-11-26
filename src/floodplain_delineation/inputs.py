@@ -1,10 +1,11 @@
-"""Stage 1: input validation and spatial preparation.
+"""Stage 1: input validation and spatial preparation (processing CRS and master grid).
 
 * Validates files, DEM metadata and the pilot-area geometry.
-* Reprojects the pilot geometry to the processing DEM CRS. The DEM has already been
-  reprojected to the configured master grid before this module is called.
-* Computes the processing extent (pilot area + context buffer) as an integer pixel
-  window of the master grid.
+* Resolves the processing CRS (projected, linear units) and the target resolution.
+* Builds the master processing grid (CRS, transform, width, height): the one grid shared by every
+  raster derived by the pipeline. The pilot geometry is reprojected to the processing CRS here.
+* When the processing CRS and resolution equal the DEM's, the grid is a window of the DEM grid and no
+  resampling happens; otherwise Stage 0 (:mod:`reprojection`) warps the DEM onto the master grid.
 """
 
 from __future__ import annotations
@@ -28,9 +29,12 @@ from .config import Config
 from .exceptions import InputError
 from .logging_utils import WarningCollector, get_logger
 from .spatial import (
-    buffer_distance_in_crs_units,
+    ProcessingCrs,
+    cell_geometry,
     check_supported_crs,
-    linear_units_factor,
+    densified_footprint,
+    resolve_processing_crs,
+    same_crs,
     to_pyproj,
 )
 
@@ -57,19 +61,60 @@ class DemInfo:
         return abs(self.transform.a), abs(self.transform.e)
 
 
+@dataclass(frozen=True)
+class ProcessingGrid:
+    """The master grid. Every raster derived by the pipeline has exactly this CRS/transform/shape."""
+
+    crs: RioCRS
+    pcrs: pyproj.CRS
+    transform: Affine
+    width: int
+    height: int
+    identical_to_source: bool                 # True: a window of the DEM grid (no resampling)
+    source_window: Optional[Window] = None    # that window, when identical_to_source
+
+    @property
+    def res_x(self) -> float:
+        return abs(self.transform.a)
+
+    @property
+    def res_y(self) -> float:
+        return abs(self.transform.e)
+
+    @property
+    def bounds(self) -> Tuple[float, float, float, float]:
+        t = self.transform
+        return (t.c, t.f + t.e * self.height, t.c + t.a * self.width, t.f)
+
+    def describe(self) -> Dict[str, object]:
+        return {
+            "crs": self.crs.to_string(),
+            "width": self.width,
+            "height": self.height,
+            "cells": self.width * self.height,
+            "resolution": [self.res_x, self.res_y],
+            "transform": list(tuple(self.transform))[:6],
+            "bounds": list(self.bounds),
+            "identical_to_source_grid": self.identical_to_source,
+        }
+
+
 @dataclass
 class SpatialDomain:
-    pilot_full: BaseGeometry          # dissolved pilot geometry, DEM CRS (may extend beyond DEM)
-    pilot: BaseGeometry               # pilot ∩ DEM footprint (used for final clipping)
+    pilot_full: BaseGeometry          # dissolved pilot geometry, processing CRS (may extend beyond the DEM)
+    pilot: BaseGeometry               # pilot ∩ DEM footprint (processing CRS; used for final clipping)
     source_crs: str                   # CRS of the pilot file (as written)
     n_features: int
-    coverage_fraction: float          # area(pilot ∩ DEM) / area(pilot)
-    window: Window                    # processing window on the DEM grid (integers)
-    window_transform: Affine
-    extent_bounds: Tuple[float, float, float, float]
-    requested_bounds: Tuple[float, float, float, float]
+    coverage_fraction: float          # area(pilot ∩ DEM footprint) / area(pilot)
+    window: Optional[Window]          # processing window on the DEM grid; None when the grid is warped
+    window_transform: Affine          # transform of the master grid
+    extent_bounds: Tuple[float, float, float, float]      # master grid bounds (processing CRS)
+    requested_bounds: Tuple[float, float, float, float]   # pilot (+ buffer) bounds before clipping
     truncated_sides: List[str]
     buffer_info: Dict[str, object] = field(default_factory=dict)
+    grid: Optional[ProcessingGrid] = None
+    processing_crs: Optional[ProcessingCrs] = None
+    resolution_info: Dict[str, object] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -143,11 +188,11 @@ def _repair(geom: BaseGeometry) -> Optional[BaseGeometry]:
 
 
 def read_pilot_geometry(
-    path: Path, layer: Optional[str], dem: DemInfo, warnings: WarningCollector
+    path: Path, layer: Optional[str], target_pcrs: pyproj.CRS, warnings: WarningCollector
 ) -> Tuple[BaseGeometry, str, int]:
-    """Read, validate, repair, reproject to the DEM CRS and dissolve the pilot area.
+    """Read, validate, repair, reproject to the processing CRS and dissolve the pilot area.
 
-    Returns ``(geometry_in_dem_crs, source_crs_string, n_input_features)``.
+    Returns ``(geometry_in_processing_crs, source_crs_string, n_input_features)``.
     """
     try:
         import pyogrio
@@ -202,12 +247,12 @@ def read_pilot_geometry(
         raise InputError("All pilot-area geometries are empty after validity repair.")
 
     series = gpd.GeoSeries(kept, crs=gdf.crs)
-    if pyproj.CRS(series.crs) != dem.pcrs:
-        log.info("Reprojecting pilot area from %s to the DEM CRS (%s).", source_crs, dem.crs.to_string())
+    if not same_crs(pyproj.CRS(series.crs), target_pcrs):
+        log.info("Reprojecting pilot area from %s to the processing CRS (%s).", source_crs, target_pcrs.name)
         try:
-            series = series.to_crs(dem.pcrs)
+            series = series.to_crs(target_pcrs)
         except Exception as exc:
-            raise InputError(f"Cannot transform pilot area to the DEM CRS: {exc}") from exc
+            raise InputError(f"Cannot transform pilot area to the processing CRS: {exc}") from exc
     if not all(math.isfinite(v) for g in series for v in g.bounds):
         raise InputError("Pilot-area geometry has non-finite coordinates after reprojection.")
 
@@ -222,22 +267,17 @@ def read_pilot_geometry(
     return merged, source_crs, n_input
 
 
-def _buffer_geometry(geom: BaseGeometry, dem: DemInfo, distance: float, units: str) -> Tuple[BaseGeometry, Dict[str, object]]:
-    """Buffer ``geom`` (DEM CRS). Geographic DEMs are buffered in a local UTM CRS."""
+def _buffer_geometry(
+    geom: BaseGeometry, proc: ProcessingCrs, res: Tuple[float, float], distance: float, units: str
+) -> Tuple[BaseGeometry, Dict[str, object]]:
+    """Buffer ``geom`` (processing CRS, projected). ``cells`` = processing-grid cells."""
     info: Dict[str, object] = {"requested_distance": distance, "units": units}
     if distance == 0:
         info["method"] = "none"
         return geom, info
-    direct = buffer_distance_in_crs_units(distance, units, dem.pcrs, dem.transform)
-    if direct is not None:
-        info.update(method="dem_crs", distance_in_crs_units=direct, buffer_crs=dem.crs.to_string())
-        return geom.buffer(direct), info
-    series = gpd.GeoSeries([geom], crs=dem.pcrs)
-    utm = series.estimate_utm_crs()
-    buffered = series.to_crs(utm).buffer(distance).to_crs(dem.pcrs).iloc[0]
-    info.update(method="projected_crs", buffer_crs=utm.to_string())
-    log.info("Geographic DEM CRS: buffer computed in %s and transformed back.", utm.to_string())
-    return buffered, info
+    direct = distance * max(res) if units == "cells" else distance / proc.unit_factor
+    info.update(method="processing_crs", distance_in_crs_units=direct, buffer_crs=proc.crs.to_string())
+    return geom.buffer(direct), info
 
 
 def bounds_to_window(
@@ -270,172 +310,184 @@ def bounds_to_window(
         sides.append("north")
     return window, actual, sides
 
+def resolve_target_resolution(
+    dem: DemInfo, proc: ProcessingCrs, target: Optional[float], warnings: Optional[WarningCollector] = None
+) -> Tuple[Tuple[float, float], Dict[str, object]]:
+    """Resolution (x, y) of the master grid in processing-CRS units, and how it was obtained.
+
+    * ``target`` given: that value (square cells);
+    * ``null`` and the DEM already in the processing CRS: the DEM's own resolution (kept exactly);
+    * ``null`` otherwise: the resolution GDAL suggests for the whole DEM (``calculate_default_transform``:
+      square cells, preserving roughly the same number of cells along the DEM diagonal). Deterministic
+      for a given DEM, CRS and GDAL version.
+    """
+    same = same_crs(dem.pcrs, proc.pcrs)
+    if target is not None:
+        res, how = (float(target), float(target)), "configured (processing.target_resolution)"
+    elif same:
+        res, how = dem.resolution, "native resolution of the DEM (already in the processing CRS)"
+    else:
+        from rasterio.warp import calculate_default_transform
+
+        try:
+            suggested, _, _ = calculate_default_transform(dem.crs, proc.crs, dem.width, dem.height, *dem.bounds)
+        except Exception as exc:
+            raise InputError(f"Cannot derive a target resolution for the processing CRS: {exc}") from exc
+        r = abs(suggested.a)
+        if not (math.isfinite(r) and r > 0):
+            raise InputError("GDAL could not suggest a valid target resolution; set processing.target_resolution.")
+        res, how = (r, r), "derived: GDAL calculate_default_transform over the full DEM (square cells)"
+    src = cell_geometry(dem.pcrs, dem.transform, dem.bounds)
+    src_size_m = math.sqrt(src.area_m2)
+    tgt_size_m = math.sqrt(res[0] * res[1]) * proc.unit_factor
+    info: Dict[str, object] = {
+        "target_resolution_crs_units": list(res),
+        "source": how,
+        "source_cell_size_m_approx": src_size_m,
+        "target_cell_size_m": tgt_size_m,
+        "target_to_source_cell_size_ratio": tgt_size_m / src_size_m if src_size_m > 0 else None,
+    }
+    if warnings is not None and src_size_m > 0:
+        ratio = tgt_size_m / src_size_m
+        if ratio > 1.05:
+            warnings.add(
+                f"The processing resolution ({tgt_size_m:.2f} m) is coarser than the source DEM "
+                f"(~{src_size_m:.2f} m): terrain detail is discarded by the reprojection."
+            )
+        elif ratio < 0.95:
+            warnings.add(
+                f"The processing resolution ({tgt_size_m:.2f} m) is finer than the source DEM "
+                f"(~{src_size_m:.2f} m): no real detail is added, but the number of cells grows."
+            )
+    return res, info
+
+
+def _snap_grid(
+    bounds: Tuple[float, float, float, float], res: Tuple[float, float], pcrs: pyproj.CRS, crs: RioCRS
+) -> ProcessingGrid:
+    """Grid whose lattice is anchored at the CRS origin (multiples of the resolution) and covers ``bounds``."""
+    eps = 1e-9
+    rx, ry = res
+    left, bottom, right, top = bounds
+    c0, c1 = math.floor(left / rx + eps), math.ceil(right / rx - eps)
+    r0, r1 = math.floor(bottom / ry + eps), math.ceil(top / ry - eps)
+    width, height = int(c1 - c0), int(r1 - r0)
+    if width < 1 or height < 1:
+        raise InputError("The processing extent is smaller than one cell of the processing grid.")
+    transform = Affine(rx, 0.0, c0 * rx, 0.0, -ry, r1 * ry)
+    return ProcessingGrid(crs, pcrs, transform, width, height, identical_to_source=False)
+
+
 def prepare_spatial_domain(
     dem: DemInfo,
     config: Config,
     warnings: WarningCollector,
 ) -> SpatialDomain:
-    """Build the pilot geometry, its DEM intersection and the processing window."""
+    """Resolve the processing CRS/resolution, reproject the pilot area and build the master grid."""
+    cfg = config.processing
+    proc = resolve_processing_crs(cfg.crs)
+    res, res_info = resolve_target_resolution(dem, proc, cfg.target_resolution, warnings)
+    same = same_crs(dem.pcrs, proc.pcrs)
+    identical = same and math.isclose(res[0], dem.resolution[0], rel_tol=1e-9) and math.isclose(
+        res[1], dem.resolution[1], rel_tol=1e-9
+    )
+    res_info["grid_alignment"] = (
+        "window of the source DEM grid (same CRS and resolution: no resampling)"
+        if identical else "lattice anchored at the CRS origin (multiples of the resolution)"
+    )
+
+    # Footprint of the DEM in the processing CRS: edges densified, so curved/rotated footprints are not underestimated.
+    footprint = densified_footprint(tuple(dem.bounds), dem.pcrs, proc.pcrs)
+    fbounds = footprint.bounds
+
+    def build_grid(requested: Tuple[float, float, float, float]):
+        """Master grid for ``requested`` bounds, clipped to the DEM footprint; also the truncated sides."""
+        clipped = (max(requested[0], fbounds[0]), max(requested[1], fbounds[1]),
+                   min(requested[2], fbounds[2]), min(requested[3], fbounds[3]))
+        if clipped[2] <= clipped[0] or clipped[3] <= clipped[1]:
+            raise InputError("The processing extent does not overlap the DEM grid.")
+        tol = 1e-6 * min(res)
+        sides = [n for n, cut in (("west", requested[0] < fbounds[0] - tol), ("south", requested[1] < fbounds[1] - tol),
+                                  ("east", requested[2] > fbounds[2] + tol), ("north", requested[3] > fbounds[3] + tol)) if cut]
+        if identical:
+            window, actual, _ = bounds_to_window(clipped, dem)
+            grid = ProcessingGrid(
+                proc.crs, proc.pcrs, rasterio.windows.transform(window, dem.transform), int(window.width),
+                int(window.height), identical_to_source=True, source_window=window,
+            )
+            return grid, window, sides
+        return _snap_grid(clipped, res, proc.pcrs, proc.crs), None, sides
 
     # ------------------------------------------------------------------
-    # No pilot area provided:
-    # use the complete DEM footprint as the processing and final area.
-    # A buffer is not applied because there is no raster context outside
-    # the DEM footprint to support additional hydrological routing.
+    # No pilot area: the whole DEM footprint is the processing and final area.
     # ------------------------------------------------------------------
     if not config.inputs.pilot_area:
         warnings.add(
-            "No pilot area was provided; the DEM bounding box is being used "
+            "No pilot area was provided; the DEM footprint (bounding box in the processing CRS) is used "
             "as the processing and final output area."
         )
-
-        footprint = box(*dem.bounds)
-
-        if config.processing.buffer_distance > 0:
+        if cfg.buffer_distance > 0:
             warnings.add(
-                "buffer_distance is ignored because no pilot area was provided. "
-                "The DEM bounding box already defines the complete available "
-                "processing extent, and no raster context exists outside the DEM."
+                "buffer_distance is ignored because no pilot area was provided. The DEM footprint already "
+                "defines the complete available processing extent, and no raster context exists outside the DEM."
             )
-
-        # The entire DEM is the processing window.
-        window = rasterio.windows.Window(
-            col_off=0,
-            row_off=0,
-            width=dem.width,
-            height=dem.height,
-        )
-
-        actual = tuple(dem.bounds)
-        requested = actual
-
-        truncated = [
-            "left",
-            "right",
-            "top",
-            "bottom",
-        ]
-
-        binfo = {
-            "distance": 0,
-            "units": config.processing.buffer_units,
-            "applied": False,
-            "reason": (
-                "No pilot area was provided; the DEM footprint defines the "
-                "complete processing and output extent."
-            ),
-            "note": (
-                "No external context is available beyond the DEM boundary. "
-                "Flow routing near the DEM edges may therefore be affected "
-                "by artificial boundary effects."
-            ),
-        }
-
+        grid, window, _ = build_grid(fbounds)
+        pilot = box(*grid.bounds)
         warnings.add(
-            "The processing area coincides with the DEM footprint. "
-            "Hydrological routing near the DEM boundaries may lack upstream "
-            "context and may be affected by artificial edge effects."
+            "The processing area coincides with the DEM footprint. Hydrological routing near the DEM boundaries "
+            "may lack upstream context and may be affected by artificial edge effects."
         )
-
         return SpatialDomain(
-            pilot_full=footprint,
-            pilot=footprint,
-            source_crs=dem.crs.to_string(),
-            n_features=1,
-            coverage_fraction=1.0,
-            window=window,
-            window_transform=dem.transform,
-            extent_bounds=actual,
-            requested_bounds=requested,
-            truncated_sides=truncated,
-            buffer_info=binfo,
+            pilot_full=pilot, pilot=pilot, source_crs=dem.crs.to_string(), n_features=1, coverage_fraction=1.0,
+            window=window, window_transform=grid.transform, extent_bounds=grid.bounds, requested_bounds=fbounds,
+            truncated_sides=["left", "right", "top", "bottom"],
+            buffer_info={
+                "distance": 0, "units": cfg.buffer_units, "applied": False,
+                "reason": "No pilot area was provided; the DEM footprint defines the complete processing and output extent.",
+                "note": "No external context is available beyond the DEM boundary. Flow routing near the DEM edges "
+                        "may therefore be affected by artificial boundary effects.",
+            },
+            grid=grid, processing_crs=proc, resolution_info=res_info,
         )
 
     # ------------------------------------------------------------------
-    # Normal workflow:
-    # read and validate the pilot area from the GPKG.
+    # Normal workflow: read the pilot area and reproject it to the processing CRS.
     # ------------------------------------------------------------------
     pilot_full, src_crs, n_features = read_pilot_geometry(
-        config.inputs.pilot_area,
-        config.inputs.pilot_layer,
-        dem,
-        warnings,
+        config.inputs.pilot_area, config.inputs.pilot_layer, proc.pcrs, warnings
     )
-
-    footprint = box(*dem.bounds)
-
-    inter = _polygonal_part(
-        pilot_full.intersection(footprint)
-    )
-
+    inter = _polygonal_part(pilot_full.intersection(footprint))
     if inter is None or inter.area <= 0:
         raise InputError(
-            "The pilot area does not intersect the DEM footprint. "
-            "Check that both datasets cover the same region. "
-            f"DEM bounds: {dem.bounds}; "
-            f"pilot bounds (DEM CRS): {pilot_full.bounds}."
+            "The pilot area does not intersect the DEM footprint. Check that both datasets cover the same region. "
+            f"DEM footprint bounds (processing CRS): {tuple(round(v, 3) for v in fbounds)}; "
+            f"pilot bounds (processing CRS): {pilot_full.bounds}."
         )
-
     coverage = inter.area / pilot_full.area
-
     if coverage < 1 - 1e-9:
         warnings.add(
-            f"Only {coverage:.1%} of the pilot area lies within the DEM "
-            "footprint; the final map is restricted to the covered part."
+            f"Only {coverage:.1%} of the pilot area lies within the DEM footprint; "
+            "the final map is restricted to the covered part."
         )
-
-    # ------------------------------------------------------------------
-    # Apply the configured buffer only when an explicit pilot area exists.
-    # ------------------------------------------------------------------
-    buffer_cfg = config.processing
-
-    buffered, binfo = _buffer_geometry(
-        pilot_full,
-        dem,
-        buffer_cfg.buffer_distance,
-        buffer_cfg.buffer_units,
-    )
-
-    if buffer_cfg.buffer_distance == 0:
+    buffered, binfo = _buffer_geometry(pilot_full, proc, res, cfg.buffer_distance, cfg.buffer_units)
+    if cfg.buffer_distance == 0:
         warnings.add(
-            "buffer_distance is 0: hydrological processing runs on a "
-            "tightly clipped DEM and is exposed to artificial edge effects."
+            "buffer_distance is 0: hydrological processing runs on a tightly clipped DEM and is exposed to "
+            "artificial edge effects."
         )
-
     requested = tuple(buffered.bounds)
-
-    window, actual, truncated = bounds_to_window(
-        requested,
-        dem,
-    )
-
+    grid, window, truncated = build_grid(requested)
     if truncated:
         warnings.add(
-            f"The requested context buffer is truncated by the DEM edge "
-            f"on the {', '.join(truncated)} side(s); flow routing near "
-            "those sides lacks upstream context."
+            f"The requested context buffer is truncated by the DEM edge on the {', '.join(truncated)} side(s); "
+            "flow routing near those sides lacks upstream context."
         )
-
-    warnings_note = (
-        "A buffer cannot guarantee correct upstream hydrology if the DEM "
-        "does not extend sufficiently beyond the area of interest."
+    binfo["note"] = (
+        "A buffer cannot guarantee correct upstream hydrology if the DEM does not extend sufficiently "
+        "beyond the area of interest."
     )
-
-    binfo["note"] = warnings_note
-
     return SpatialDomain(
-        pilot_full=pilot_full,
-        pilot=inter,
-        source_crs=src_crs,
-        n_features=n_features,
-        coverage_fraction=coverage,
-        window=window,
-        window_transform=rasterio.windows.transform(
-            window,
-            dem.transform,
-        ),
-        extent_bounds=actual,
-        requested_bounds=requested,
-        truncated_sides=truncated,
-        buffer_info=binfo,
+        pilot_full=pilot_full, pilot=inter, source_crs=src_crs, n_features=n_features, coverage_fraction=coverage,
+        window=window, window_transform=grid.transform, extent_bounds=grid.bounds, requested_bounds=requested,
+        truncated_sides=truncated, buffer_info=binfo, grid=grid, processing_crs=proc, resolution_info=res_info,
     )
