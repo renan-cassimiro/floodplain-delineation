@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import copy
 from pathlib import Path
 
@@ -98,3 +99,10 @@ def wbt_executable_available() -> bool:
 
 
 requires_wbt = pytest.mark.skipif(not wbt_executable_available(), reason="WhiteboxTools executable not available")
+
+
+# The fake WhiteboxTools executable must be executable; archives/zip extraction can drop the bit.
+try:
+    os.chmod(Path(__file__).parent / "fake_wbt.py", 0o755)
+except OSError:  # pragma: no cover
+    pass

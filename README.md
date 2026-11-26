@@ -36,12 +36,12 @@ pip install -e .            # optional: installs the `floodplain-delineation` co
 
 ## 3. Input specification
 
-| Input | Requirements |
-|---|---|
-| **DEM** | Single band; valid CRS (projected or geographic); **nodata value defined**; north-up, non-rotated grid. Vertical units are declared in the config (`inputs.vertical_units`) and are the unit of the HAND threshold. |
+| Input                | Requirements                                                                                                                                                                                                                                            |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **DEM**        | Single band; valid CRS (projected or geographic); **nodata value defined**; north-up, non-rotated grid. Vertical units are declared in the config (`inputs.vertical_units`) and are the unit of the HAND threshold.                             |
 | **Pilot area** | GeoPackage with >= 1 polygon feature (`inputs.pilot_layer` optional). Must have a CRS. Invalid polygons are repaired (`make_valid`) with a warning; several polygons are dissolved into one. Non-polygon/empty features are dropped with a warning. |
 
-* Only the **pilot geometry** is reprojected (to the DEM CRS). The DEM is never reprojected or resampled.
+* The DEM is reprojected first to the configured processing CRS (`ESRI:102033` by default); the pilot geometry is then reprojected to that same CRS. All hydrological products share the resulting grid.
 * The pilot area must intersect the DEM footprint, otherwise the run fails with a clear error.
 * Integer DEMs are stored as float32 in the intermediate extract (values unchanged). A NaN nodata is
   replaced by the explicit sentinel `-9999` (warning recorded).
@@ -63,30 +63,39 @@ Relative paths in the YAML are resolved against the **current working directory*
 
 See `config/example.yaml`. Every scientific parameter is **required**; unknown keys are rejected.
 
-| Key | Required | Units / values | Notes |
-|---|---|---|---|
-| `inputs.dem`, `inputs.pilot_area` | yes | paths | |
-| `inputs.pilot_layer` | no | layer name or `null` | warning if the GPKG has several layers and none is named |
-| `inputs.vertical_units` | yes | `meters`, `centimeters`, `decimeters`, `feet`, `us_survey_feet` | documents the unit of DEM and HAND threshold |
-| `processing.buffer_distance` | yes | `>= 0`, in `buffer_units` | context around the pilot area |
-| `processing.buffer_units` | no (default `meters`) | `meters`, `cells` | geographic DEMs: metric buffer computed in a local UTM CRS and transformed back |
-| `processing.conditioning.method` | yes | `breach`, `fill` | see section 6 |
-| `processing.flow.algorithm` | yes | `d8` | the only supported algorithm |
-| `processing.drainage.threshold_type` | yes | `cells`, `area_km2` | |
-| `processing.drainage.threshold_value` | yes | `> 0` (whole number for `cells`) | minimum contributing cells / km2 |
-| `processing.hand.threshold` | yes | `>= 0`, DEM vertical units | |
-| `outputs.directory` | yes | path | |
-| `outputs.intermediates`, `outputs.final` | no (`intermediate`, `final`) | relative names | must differ, no `..` |
-| `outputs.save_*` | no (`true`) | bool | `false` deletes that intermediate after the run |
-| `execution.overwrite` | no (`false`) | bool | conflicts are checked **before** any processing |
-| `execution.verbose` | no (`true`) | bool | DEBUG vs INFO logging |
-| `execution.whitebox_executable` | no | path | |
+| Key                                          | Required                         | Units / values                                                            | Notes                                                                                                                |
+| -------------------------------------------- | -------------------------------- | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `inputs.dem`, `inputs.pilot_area`        | yes                              | paths                                                                     | `pilot_area: null` processes the whole DEM footprint                                                               |
+| `inputs.pilot_layer`                       | no                               | layer name or `null`                                                    | warning if the GPKG has several layers and none is named                                                             |
+| `inputs.vertical_units`                    | yes                              | `meters`, `centimeters`, `decimeters`, `feet`, `us_survey_feet` | documents the unit of DEM and HAND threshold                                                                         |
+| `processing.buffer_distance`               | yes                              | `>= 0`, in `buffer_units`                                             | context around the pilot area                                                                                        |
+| `processing.buffer_units`                  | no (default `meters`)          | `meters`, `cells`                                                     | geographic DEMs: metric buffer computed in a local UTM CRS and transformed back                                      |
+| `processing.conditioning.method`           | yes                              | `breach`, `fill`                                                      | see section 6                                                                                                        |
+| `processing.flow.algorithm`                | yes                              | `d8`                                                                    | the only supported algorithm                                                                                         |
+| `processing.drainage.threshold_type`       | yes                              | `cells`, `area_km2`                                                   |                                                                                                                      |
+| `processing.drainage.threshold_value`      | yes                              | `> 0` (whole number for `cells`)                                      | minimum contributing cells / km2                                                                                     |
+| `processing.hand.threshold`                | yes                              | `>= 0`, DEM vertical units                                              |                                                                                                                      |
+| `processing.crs`                           | no (`ESRI:102033`)             | projected CRS identifier                                                  | global processing CRS; `ESRI:102033` is not `EPSG:102033`                                                        |
+| `processing.target_resolution`             | no (`null`)                    | map units                                                                 | target pixel size; null uses GDAL suggested resolution                                                               |
+| `processing.dem_resampling`                | no (`bilinear`)                | `nearest`, `bilinear`, `cubic`                                      | DEM reprojection resampling                                                                                          |
+| `processing.rem.enabled`                   | no (`false`)                   | bool                                                                      | enable basin-wise IDW REM                                                                                            |
+| `processing.rem.sampling_interval_pixels`  | no (`10`)                      | positive integer                                                          | every Nth drainage pixel per basin in deterministic raster scan order                                                |
+| `processing.rem.idw_power`                 | no (`2.0`)                     | positive number                                                           | IDW distance exponent                                                                                                |
+| `outputs.directory`                        | yes                              | path                                                                      |                                                                                                                      |
+| `outputs.intermediates`, `outputs.final` | no (`intermediate`, `final`) | relative names                                                            | must differ, no `..`                                                                                               |
+| `outputs.save_*`                           | no (`true`)                    | bool                                                                      | `false` deletes that intermediate after the run                                                                    |
+| `execution.overwrite`                      | no (`false`)                   | bool                                                                      | start from scratch; conflicts are checked **before** any processing                                            |
+| `execution.resume`                         | no (`false`)                   | bool                                                                      | reuse up-to-date stages of a previous run (section 10). Mutually exclusive with `overwrite`                        |
+| `execution.verbose`                        | no (`true`)                    | bool                                                                      | DEBUG vs INFO logging                                                                                                |
+| `execution.whitebox_executable`            | no                               | path                                                                      |                                                                                                                      |
+| `execution.whitebox_version`               | no                               | e.g. `"2.4.0"`                                                          | exact WhiteboxTools version required; without it a warning is recorded for versions not covered by the tests         |
+| `execution.max_procs`                      | no                               | integer >= 1                                                              | passed to WhiteboxTools as `--max_procs`; many of its tools are single-threaded, so the effect depends on the tool |
+| `execution.heartbeat_seconds`              | no (`300`)                     | seconds >= 1                                                              | interval of the progress message while a long WhiteboxTools run is active                                            |
+| `execution.scratch_directory`              | no                               | path                                                                      | fast local disk for the *raw* WhiteboxTools outputs (see section 10)                                               |
 
 ## 6. Processing methodology
 
-1. **Spatial preparation.** Pilot geometry is validated/repaired, reprojected, dissolved, intersected with the
-   DEM footprint, buffered, and converted to an **integer pixel window of the original DEM grid** (so no
-   resampling). Sides where the DEM edge truncates the requested buffer are reported. *A buffer cannot guarantee
+1. **Initial reprojection and spatial preparation.** The full source DEM is reprojected to the configured projected processing CRS (`ESRI:102033` by default). The target resolution can be set explicitly; when `null`, GDAL suggested output resolution is used. The pilot geometry is then reprojected, validated/repaired, dissolved, intersected with the reprojected DEM footprint, buffered, and converted to an integer pixel window of the master grid. Sides where the DEM edge truncates the requested buffer are reported. *A buffer cannot guarantee
    correct upstream hydrology if the DEM does not extend far enough beyond the area of interest.*
 2. **Conditioning** (`dem_processing_extent.tif` is the unconditioned copy; the source DEM is never modified).
    * `breach` (**default**) -> `BreachDepressions` (Lindsay 2016). Lowers terrain along least-cost paths; keeps
@@ -94,7 +103,7 @@ See `config/example.yaml`. Every scientific parameter is **required**; unknown k
      maximum elevation change are reported.
    * `fill` -> `FillDepressionsWangAndLiu --fix_flats`. Raises terrain inside depressions, which can create
      artificial flats. See *Known issues*.
-   The result is validated: same grid, finite values, and an **identical nodata footprint**; any difference is an error.
+     The result is validated: same grid, finite values, and an **identical nodata footprint**; any difference is an error.
 3. **Flow routing (D8 only).** `D8Pointer` -> `D8FlowAccumulation` (from the pointer, output in cells; each cell counts itself).
 4. **Drainage network.** `ExtractStreams`. Cells with accumulation **>= N** are drainage. WhiteboxTools marks cells strictly
    *greater* than its threshold, so `N - 0.5` is passed (accumulation is integer valued; verified by tests).
@@ -112,12 +121,16 @@ See `config/example.yaml`. Every scientific parameter is **required**; unknown k
 ```
 outputs/
 ├── intermediate/
+│   ├── dem_processing_crs.tif      source DEM reprojected to the processing CRS/master grid
 │   ├── dem_processing_extent.tif   unconditioned DEM over the processing extent (source dtype, float32 for ints)
 │   ├── conditioned_dem.tif         conditioned DEM (processing extent)
 │   ├── flow_direction.tif          D8 codes: 1=NE 2=E 4=SE 8=S 16=SW 32=W 64=NW 128=N, 0=no downstream neighbour
 │   ├── flow_accumulation.tif       contributing cells
 │   ├── drainage_network.tif        uint8: 1 drainage, 0 other, 255 nodata
-│   └── hand.tif                    HAND in DEM vertical units (nodata where no drainage association)
+│   ├── hand.tif                    HAND in DEM vertical units (nodata where no drainage association)
+   ├── basins.tif                  WhiteboxTools basin IDs (only when REM is enabled)
+   ├── rem_drainage_surface.tif    basin-wise IDW drainage-elevation surface (only when REM is enabled)
+   └── rem.tif                     conditioned DEM minus IDW surface (only when REM is enabled)
 ├── final/
 │   └── potential_floodplain.tif    uint8: 1 potential floodplain, 0 other, 255 nodata; clipped to the pilot area
 ├── processing_area.gpkg            pilot (clipped / full), requested and effective processing extents
@@ -155,7 +168,42 @@ whole processing extent (pilot + buffer); only the final product is clipped. `pr
 The summary stores the effective configuration, the SHA-256 of the YAML file, input paths, software versions (Python, numpy,
 rasterio, GDAL, geopandas, shapely, pyproj, PyYAML, `whitebox` package, WhiteboxTools binary), every WhiteboxTools call (tool,
 flags, exit status), UTC timestamps, warnings and limitations. Output organisation is fixed as shown above.
-Reusing `hand.tif` to try another HAND threshold is possible manually; no caching system is implemented.
+Stage fingerprints and the durations/peak memory of every stage and WhiteboxTools call are stored too (section 10).
+
+## 10. Large rasters, resume and monitoring (v0.2.0)
+
+Developed after a run on a ~917 M-cell DEM (18 993 x 48 316) that failed in `D8Pointer`.
+
+**WhiteboxTools outputs are rewritten by GDAL.** Each raster written by WhiteboxTools (to a raw file in the working
+directory) is copied block by block by GDAL into its final name (same grid, dtype, nodata, CRS, uncompressed GeoTIFF/BigTIFF)
+before any other tool reads it. Reason: WhiteboxTools 2.4.0 could not read its own 3.7 GB `conditioned_dem.tif`
+(`Error converting TAG(34737) to ASCII` in `whitebox-raster/.../ifd.rs`) although GDAL read it correctly, while it did read a
+GDAL-written file of the same size. The root cause inside WhiteboxTools was **not** confirmed; the rewrite is a workaround
+that follows from that observation and has been tested here only with the 2.0.0 binary (where the failure does not occur).
+
+**Memory.** Validation, statistics and the final mask are computed on full-width row stripes (`rasters.BLOCK_BYTES`, 192 MB),
+so Python memory does not grow with the raster. Measured here (synthetic data): 0.42 GiB peak at 180 M cells; the previous
+whole-array code needed 1.11 GiB at 36 M cells (about 31 bytes per cell). WhiteboxTools itself still loads whole rasters;
+its memory is sampled and reported per call. HAND percentiles come from a 100 000-bin histogram (error <= one bin width,
+reported in the summary); other statistics are exact.
+
+**Resume.** `execution.resume: true` reuses a stage when its fingerprint (relevant parameters, upstream fingerprints, DEM path/size/mtime,
+window, WhiteboxTools and package version) matches `stage_manifest.json` and its output files exist with the recorded size.
+Examples: changing `hand.threshold` re-runs only the final stage; changing the drainage threshold re-runs drainage and HAND;
+changing the DEM, window, conditioning method or WhiteboxTools version re-runs what depends on it. A failed or interrupted run
+keeps its completed stages. Limits: the DEM is identified by path/size/mtime, not content hash; hand-edited intermediates are
+only detected through their size. With `save_*: false` a deleted intermediate is recomputed only if a later stage needs it.
+
+**Monitoring.** The log shows, per stage, elapsed time and peak memory; during WhiteboxTools runs it prints a heartbeat every
+`heartbeat_seconds` (elapsed time, tool memory) and streams the tool output to DEBUG. Before heavy work a pre-flight estimate
+(raster size, disk needed vs free, available memory/container limit, CPUs) is logged and warnings are recorded. The conditioning
+diagnostics include the distribution of elevation decreases (approximate p50/p95/p99 and the number of cells lowered by more than
+1, 5, 10, 25 and 50 vertical units). `processing_summary.json` has `preflight`, `performance`, `whitebox_calls` (seconds and sampled
+memory) and `stages_reused_from_previous_run`.
+
+**Practical.** Run long jobs detached (`nohup ... &` or `tmux`) so a closed Jupyter session cannot kill them. Check
+`cat /sys/fs/cgroup/memory.max`: the container limit may be below the machine's RAM. Point `outputs.directory` (and optionally
+`execution.scratch_directory`) to local disk if the input lives on a network file system.
 
 ## 11. Tests
 
@@ -163,5 +211,45 @@ Reusing `hand.tif` to try another HAND threshold is possible manually; no cachin
 pytest                    # all tests
 pytest -m "not wbt"       # skip tests that need the WhiteboxTools executable
 ```
-Tests use synthetic rasters only. Tests marked `wbt` run the real executable (they are skipped if it is not found);
+
+Tests use synthetic rasters only (131 tests, including resume scenarios, stripe-independence of every block-wise stage and the GDAL rewrite). Tests marked `wbt` run the real executable (they are skipped if it is not found);
 failure propagation is tested with a fake executable (`tests/fake_wbt.py`).
+
+## Processing CRS and REM
+
+The source DEM is reprojected before hydrological processing. The default processing CRS is
+`ESRI:102033` (South America Albers Equal Area Conic; do not label it `EPSG:102033`).
+Set `processing.target_resolution` to a positive map-unit value to choose the output pixel size;
+when `null`, GDAL's suggested output resolution is used. `processing.dem_resampling` accepts
+`nearest`, `bilinear` (default), or `cubic`. All hydrological rasters are derived on this one
+processing grid.
+
+The optional basin-wise REM is enabled with:
+
+```yaml
+processing:
+  crs: "ESRI:102033"
+  target_resolution: null
+  dem_resampling: "bilinear"
+  rem:
+    enabled: true
+    sampling_interval_pixels: 10
+    idw_power: 2.0
+```
+
+When enabled, WhiteboxTools `Basins` is run on the existing D8 pointer raster. Drainage-cell
+elevations are sampled from the conditioned DEM, systematically in raster scan order and
+separately within each basin. The IDW estimate for each cell uses all sampled points in its
+own basin, with Euclidean distances in processing-CRS map units. The output surface is
+subtracted from the conditioned DEM to produce `rem.tif`; the interpolated reference surface
+is saved as `rem_drainage_surface.tif`, and basin IDs as `basins.tif`.
+
+This is a topographic reference surface derived from DEM elevations, not observed water-surface
+elevation or a hydraulic model. Exact all-sample IDW has computational cost proportional to
+the number of target cells times the number of samples in each basin; large basins and dense
+sampling can therefore be expensive. Increase `sampling_interval_pixels` to reduce the sample
+count. No search radius or neighbor truncation is applied by this implementation.
+
+## 8. Basin-wise REM
+
+Enable `processing.rem.enabled` to calculate a topographic Relative Elevation Model. WhiteboxTools `Basins` uses the existing D8 pointer raster; no second hydrological routing is performed. Drainage elevations are sampled from the conditioned DEM, every Nth valid drainage pixel per basin in deterministic raster scan order. Each basin is interpolated independently using all of its samples and Euclidean IDW in processing-CRS units. The REM is `conditioned_dem - rem_drainage_surface`. This is not a water-surface elevation. Exact all-sample IDW can be computationally expensive for large basins.

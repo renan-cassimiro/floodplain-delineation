@@ -1,9 +1,10 @@
 """Stage 1: input validation and spatial preparation.
 
 * Validates files, DEM metadata and the pilot-area geometry.
-* Reprojects the pilot geometry to the DEM CRS (explicit; the DEM is never reprojected).
+* Reprojects the pilot geometry to the processing DEM CRS. The DEM has already been
+  reprojected to the configured master grid before this module is called.
 * Computes the processing extent (pilot area + context buffer) as an integer pixel
-  window of the original DEM grid, so no resampling ever happens.
+  window of the master grid.
 """
 
 from __future__ import annotations
@@ -73,8 +74,11 @@ class SpatialDomain:
 
 # --------------------------------------------------------------------------- #
 def validate_input_files(config: Config) -> None:
-    """Check that the DEM and the pilot-area file exist and are readable.
-    for label, path in (("DEM", config.inputs.dem), ("Pilot-area GeoPackage", config.inputs.pilot_area)):
+    """Check that the DEM and (when given) the pilot-area file exist and are readable."""
+    checks = [("DEM", config.inputs.dem)]
+    if config.inputs.pilot_area is not None:
+        checks.append(("Pilot-area GeoPackage", config.inputs.pilot_area))
+    for label, path in checks:
         if not path.exists():
             raise InputError(f"{label} file not found: {path}. Check 'inputs' in the configuration.")
         if not path.is_file():
@@ -84,8 +88,8 @@ def validate_input_files(config: Config) -> None:
                 pass
         except OSError as exc:
             raise InputError(f"{label} file is not readable: {path} ({exc})") from exc
-    if config.inputs.pilot_area.suffix.lower() != ".gpkg":
-        raise InputError(f"Pilot area must be a GeoPackage (.gpkg), got: {config.inputs.pilot_area.name}")"""
+    if config.inputs.pilot_area is not None and config.inputs.pilot_area.suffix.lower() != ".gpkg":
+        raise InputError(f"Pilot area must be a GeoPackage (.gpkg), got: {config.inputs.pilot_area.name}")
 
 
 def read_dem_info(path: Path, warnings: Optional[WarningCollector] = None) -> DemInfo:
@@ -336,7 +340,7 @@ def prepare_spatial_domain(
         return SpatialDomain(
             pilot_full=footprint,
             pilot=footprint,
-            source_crs=dem.crs,
+            source_crs=dem.crs.to_string(),
             n_features=1,
             coverage_fraction=1.0,
             window=window,

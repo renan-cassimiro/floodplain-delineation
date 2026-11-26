@@ -35,7 +35,7 @@ DEFAULT_PROJECT_NAME = "potential_floodplain_delineation"
 @dataclass(frozen=True)
 class InputsConfig:
     dem: Path
-    pilot_area: Path
+    pilot_area: Optional[Path]   # None: the whole DEM footprint is processed
     pilot_layer: Optional[str]
     vertical_units: str
 
@@ -49,6 +49,12 @@ class ProcessingConfig:
     drainage_threshold_type: str
     drainage_threshold_value: float
     hand_threshold: float
+    crs: str = "ESRI:102033"
+    target_resolution: Optional[float] = None
+    dem_resampling: str = "bilinear"
+    rem_enabled: bool = False
+    rem_sampling_interval_pixels: int = 10
+    rem_idw_power: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -68,6 +74,11 @@ class ExecutionConfig:
     overwrite: bool
     verbose: bool
     whitebox_executable: Optional[Path]
+    resume: bool = False                       # reuse up-to-date stage outputs of a previous run
+    max_procs: Optional[int] = None            # passed to WhiteboxTools as --max_procs (None: tool default)
+    heartbeat_seconds: float = 300.0           # progress message interval for long WhiteboxTools runs
+    whitebox_version: Optional[str] = None     # exact WhiteboxTools version required (e.g. "2.4.0")
+    scratch_directory: Optional[Path] = None   # where raw WhiteboxTools outputs are written (fast local disk)
 
 
 @dataclass(frozen=True)
@@ -88,7 +99,7 @@ class Config:
             "project": {"name": self.project_name},
             "inputs": {
                 "dem": str(self.inputs.dem),
-                "pilot_area": str(self.inputs.pilot_area),
+                "pilot_area": str(self.inputs.pilot_area) if self.inputs.pilot_area else None,
                 "pilot_layer": self.inputs.pilot_layer,
                 "vertical_units": self.inputs.vertical_units,
             },
@@ -102,6 +113,8 @@ class Config:
                     "threshold_value": p.drainage_threshold_value,
                 },
                 "hand": {"threshold": p.hand_threshold},
+                "crs": p.crs, "target_resolution": p.target_resolution, "dem_resampling": p.dem_resampling,
+                "rem": {"enabled": p.rem_enabled, "sampling_interval_pixels": p.rem_sampling_interval_pixels, "idw_power": p.rem_idw_power},
             },
             "outputs": {
                 "directory": str(o.directory),
@@ -120,6 +133,13 @@ class Config:
                     str(self.execution.whitebox_executable)
                     if self.execution.whitebox_executable
                     else None
+                ),
+                "resume": self.execution.resume,
+                "max_procs": self.execution.max_procs,
+                "heartbeat_seconds": self.execution.heartbeat_seconds,
+                "whitebox_version": self.execution.whitebox_version,
+                "scratch_directory": (
+                    str(self.execution.scratch_directory) if self.execution.scratch_directory else None
                 ),
             },
         }
@@ -222,7 +242,7 @@ def parse_config(data: Any, *, source_path: Optional[Path] = None, source_sha256
     inp = _section(top["inputs"], "inputs", ("dem", "pilot_area", "vertical_units"), ("pilot_layer",))
     inputs = InputsConfig(
         dem=_path(inp["dem"], "inputs.dem"),
-        pilot_area=_string(inp["pilot_area"], "inputs.pilot_area", allow_none=True),
+        pilot_area=_path(inp["pilot_area"], "inputs.pilot_area") if inp["pilot_area"] is not None else None,
         pilot_layer=_string(inp.get("pilot_layer"), "inputs.pilot_layer", allow_none=True),
         vertical_units=_choice(inp["vertical_units"], "inputs.vertical_units", VERTICAL_UNITS),
     )
@@ -231,12 +251,23 @@ def parse_config(data: Any, *, source_path: Optional[Path] = None, source_sha256
         top["processing"],
         "processing",
         ("buffer_distance", "conditioning", "flow", "drainage", "hand"),
-        ("buffer_units",),
+        ("buffer_units", "crs", "target_resolution", "dem_resampling", "rem"),
     )
     cond = _section(proc["conditioning"], "processing.conditioning", ("method",))
     flow = _section(proc["flow"], "processing.flow", ("algorithm",))
     drain = _section(proc["drainage"], "processing.drainage", ("threshold_type", "threshold_value"))
     hand = _section(proc["hand"], "processing.hand", ("threshold",))
+    rem = _section(proc.get("rem", {}), "processing.rem", (), ("enabled", "sampling_interval_pixels", "idw_power"))
+    rem_enabled = _boolean(rem.get("enabled", False), "processing.rem.enabled")
+    rem_interval = _number(rem.get("sampling_interval_pixels", 10), "processing.rem.sampling_interval_pixels", minimum=1, inclusive=True)
+    if rem_interval != int(rem_interval):
+        raise ConfigError("processing.rem.sampling_interval_pixels must be a positive integer.")
+    rem_power = _number(rem.get("idw_power", 2.0), "processing.rem.idw_power", minimum=0.0, inclusive=False)
+    target_resolution = proc.get("target_resolution")
+    if target_resolution is not None:
+        target_resolution = _number(target_resolution, "processing.target_resolution", minimum=0.0, inclusive=False)
+    crs = _string(proc.get("crs", "ESRI:102033"), "processing.crs")
+    dem_resampling = _choice(proc.get("dem_resampling", "bilinear"), "processing.dem_resampling", ("nearest", "bilinear", "cubic"))
 
     threshold_type = _choice(drain["threshold_type"], "processing.drainage.threshold_type", DRAINAGE_THRESHOLD_TYPES)
     threshold_value = _number(drain["threshold_value"], "processing.drainage.threshold_value", minimum=0.0, inclusive=False)
@@ -254,6 +285,8 @@ def parse_config(data: Any, *, source_path: Optional[Path] = None, source_sha256
         drainage_threshold_type=threshold_type,
         drainage_threshold_value=threshold_value,
         hand_threshold=_number(hand["threshold"], "processing.hand.threshold", minimum=0.0, inclusive=True),
+        crs=crs, target_resolution=target_resolution, dem_resampling=dem_resampling,
+        rem_enabled=rem_enabled, rem_sampling_interval_pixels=int(rem_interval), rem_idw_power=rem_power,
     )
 
     out = _section(
@@ -285,13 +318,39 @@ def parse_config(data: Any, *, source_path: Optional[Path] = None, source_sha256
         save_hand=_boolean(out.get("save_hand", True), "outputs.save_hand"),
     )
 
-    ex = _section(top.get("execution", {}), "execution", (), ("overwrite", "verbose", "whitebox_executable"))
+    ex = _section(
+        top.get("execution", {}),
+        "execution",
+        (),
+        (
+            "overwrite", "verbose", "whitebox_executable", "resume", "max_procs",
+            "heartbeat_seconds", "whitebox_version", "scratch_directory",
+        ),
+    )
     wbt_exe = ex.get("whitebox_executable")
+    scratch = ex.get("scratch_directory")
+    max_procs = ex.get("max_procs")
+    if max_procs is not None:
+        max_procs = _number(max_procs, "execution.max_procs", minimum=1.0, inclusive=True)
+        if max_procs != int(max_procs):
+            raise ConfigError(f"'execution.max_procs' must be a whole number, got {max_procs:g}.")
+        max_procs = int(max_procs)
+    wbt_version = _string(ex.get("whitebox_version"), "execution.whitebox_version", allow_none=True)
     execution = ExecutionConfig(
         overwrite=_boolean(ex.get("overwrite", False), "execution.overwrite"),
         verbose=_boolean(ex.get("verbose", True), "execution.verbose"),
         whitebox_executable=_path(wbt_exe, "execution.whitebox_executable") if wbt_exe is not None else None,
+        resume=_boolean(ex.get("resume", False), "execution.resume"),
+        max_procs=max_procs,
+        heartbeat_seconds=_number(ex.get("heartbeat_seconds", 300), "execution.heartbeat_seconds", minimum=1.0, inclusive=True),
+        whitebox_version=wbt_version,
+        scratch_directory=_path(scratch, "execution.scratch_directory") if scratch is not None else None,
     )
+    if execution.overwrite and execution.resume:
+        raise ConfigError(
+            "'execution.overwrite' and 'execution.resume' cannot both be true: overwrite restarts from "
+            "scratch, resume reuses the up-to-date results of a previous run. Choose one."
+        )
 
     return Config(
         project_name=project_name,

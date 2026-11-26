@@ -71,3 +71,32 @@ synthetic data only.
 * Drainage length is approximate (D8 step lengths).
 * No validation, no real-data runs, no caching of intermediates.
 * Interior nodata holes in the DEM are not filled by the workflow; with `fill` they trigger an explicit error if the tool corrupts them.
+
+## 6. Version 0.2.0 - hardening for very large rasters
+
+Trigger: a ~917 M-cell DEM failed in `D8Pointer` (`Error converting TAG(34737) to ASCII`, WhiteboxTools 2.4.0).
+
+**Changes**
+* Bugs fixed: `validate_input_files` had its whole body inside a docstring (no input validation ran; 2 tests were failing);
+  `set_max_procs(18)` acted on a discarded object (no effect, hard-coded); `source_crs` stored a CRS object instead of a string;
+  `pilot_area` was typed `Path` but stored as `str`/`None`; the summary printed `"None"` for a missing pilot area; `scripts/run_pipeline.py` import.
+* A (robustness): WhiteboxTools raster outputs are rewritten by GDAL before reuse; per-stage resume with fingerprints
+  (`stage_manifest.json`); version policy (`execution.whitebox_version`, warning for untested versions); `execution.max_procs`,
+  `execution.scratch_directory`; partial/raw leftovers are removed at start; a child process is killed on interruption/timeout.
+* B (memory): extraction, conditioning comparison, flow-direction/accumulation/drainage validation, drainage diagnostics, HAND
+  statistics and the final mask are block-wise; GDAL cache fixed at 256 MB; relative tolerance for the float32 accumulation check.
+* C (observability): per-stage timing and memory, heartbeat and streamed tool output, pre-flight estimate, breach-depth distribution.
+
+**Measured here (synthetic data, 1 CPU, 3 GB RAM, WhiteboxTools 2.0.0 binary)**
+* 131 tests pass (85 before + 46 new). Baseline of the uploaded zip: 2 failed (`test_missing_input_files`, `test_cli_reports_missing_input_with_nonzero_status`, both caused by the docstring bug) and 5 errors only because unzipping lost the executable bit of `tests/fake_wbt.py` (now set by `conftest.py`).
+* Same synthetic 36 M-cell run, old vs new code: results identical (floodplain cells, HAND median); Python peak 1.11 GiB -> 0.57 GiB; wall time unchanged (~70 s, dominated by WhiteboxTools).
+* Python-only stages on a 180 M-cell raster: peak 0.42 GiB, ~3 s per stage.
+
+**Not verified**
+* The failure itself was not reproduced (no 2.4.0 binary, too little RAM/disk in the development sandbox). That the GDAL rewrite avoids it follows from the observation that
+  WhiteboxTools read a GDAL-written file of the same size; confirm on the target machine.
+* No run at the 917 M-cell scale; WhiteboxTools memory and time at that size are unmeasured (the new log reports them).
+* `--max_procs` is passed through; its effect per tool was not measured.
+* Sampled WhiteboxTools memory can miss peaks between samples (every <= 5 s); tools shorter than that report "not sampled".
+
+Not implemented (deferred by decision): alternative conditioning tools/limits, TauDEM/MPI, basin tiling.
